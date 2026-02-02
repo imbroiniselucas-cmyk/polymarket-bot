@@ -72,5 +72,7 @@ def enviar(msg: str):
 def log(msg: str):
     if DEBUG:
         print(msg, flush=True)
+
     if SEND_DEBUG_TO_TELEGRAM:
-        #
+        enviar(f"🧪 DEBUG: {msg}")
+
