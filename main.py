@@ -17,62 +17,35 @@ bot = telebot.TeleBot(TOKEN)
 GAMMA = "https://gamma-api.polymarket.com/markets"
 
 # =========================
-# AJUSTES (SEMANA 1)
+# AJUSTES (AGRESSIVO)
 # =========================
-SCAN_SECONDS = int(os.environ.get("SCAN_SECONDS", "60"))  # 30-60 recomendado
+SCAN_SECONDS = int(os.environ.get("SCAN_SECONDS", "30"))  # mais rápido
 
-# Filtros suaves (pra gerar sinal e depois apertar)
-MIN_VOLUME = float(os.environ.get("MIN_VOLUME", "5000"))        # volume total do mercado
-MIN_LIQUIDITY = float(os.environ.get("MIN_LIQUIDITY", "1000"))  # liquidez total
+# Filtros bem suaves (pra gerar sinal)
+MIN_VOLUME = float(os.environ.get("MIN_VOLUME", "1000"))
+MIN_LIQUIDITY = float(os.environ.get("MIN_LIQUIDITY", "200"))
 
 # Gatilhos (delta)
-PRICE_MOVE_PCT = float(os.environ.get("PRICE_MOVE_PCT", "0.02"))   # 0.02 = 2% em 1 scan
-VOLUME_JUMP = float(os.environ.get("VOLUME_JUMP", "2000"))         # +$2000 desde o último scan
+PRICE_MOVE_PCT = float(os.environ.get("PRICE_MOVE_PCT", "0.01"))   # 1% por scan
+VOLUME_JUMP = float(os.environ.get("VOLUME_JUMP", "500"))          # +500 por scan
 
-# Anti-spam: cooldown por (market_id, tipo)
-COOLDOWN_PRICE_MIN = int(os.environ.get("COOLDOWN_PRICE_MIN", "5"))
-COOLDOWN_VOLUME_MIN = int(os.environ.get("COOLDOWN_VOLUME_MIN", "5"))
+# Anti-spam por (market_id, tipo)
+COOLDOWN_PRICE_MIN = int(os.environ.get("COOLDOWN_PRICE_MIN", "2"))
+COOLDOWN_VOLUME_MIN = int(os.environ.get("COOLDOWN_VOLUME_MIN", "2"))
 
 # Limites
-MAX_ALERTS_PER_SCAN = int(os.environ.get("MAX_ALERTS_PER_SCAN", "8"))
+MAX_ALERTS_PER_SCAN = int(os.environ.get("MAX_ALERTS_PER_SCAN", "10"))
 
 # Healthcheck
-HEALTH_EVERY_MIN = int(os.environ.get("HEALTH_EVERY_MIN", "15"))
+HEALTH_EVERY_MIN = int(os.environ.get("HEALTH_EVERY_MIN", "10"))
 
 # Debug
-DEBUG = os.environ.get("DEBUG", "1") == "1"  # imprime no console
+DEBUG = os.environ.get("DEBUG", "1") == "1"  # imprime no console/logs
 SEND_DEBUG_TO_TELEGRAM = os.environ.get("SEND_DEBUG_TO_TELEGRAM", "0") == "1"
 
 # =========================
 # STATE (memória)
 # =========================
-STATE = {
-    "last": {},       # market_id -> {"price": float, "volume": float, "ts": float}
-    "cooldown": {},   # (market_id, alert_type) -> last_sent_ts
-    "stats": {
-        "start_ts": time.time(),
-        "scans": 0,
-        "alerts": 0,
-        "last_health_ts": 0,
-    }
-}
+STATE
 
-# =========================
-# HELPERS
-# =========================
-def now_ts() -> float:
-    return time.time()
-
-def fmt_time(ts: float) -> str:
-    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-
-def enviar(msg: str):
-    bot.send_message(CHAT_ID, msg, disable_web_page_preview=True)
-
-def log(msg: str):
-    if DEBUG:
-        print(msg, flush=True)
-
-    if SEND_DEBUG_TO_TELEGRAM:
-        enviar(f"🧪 DEBUG: {msg}")
 
