@@ -10,7 +10,7 @@ bot = telebot.TeleBot(TOKEN)
 GAMMA = "https://gamma-api.polymarket.com/markets"
 
 # ====== AJUSTES SIMPLES (você pode mudar depois) ======
-SCAN_SECONDS = 15 * 60          # 15 min
+SCAN_SECONDS = 1 * 60          # 1 min
 MIN_VOLUME = 20000              # mínimo volume (quanto maior, menos ruído)
 MIN_LIQUIDITY = 8000            # mínimo liquidez
 MIN_MOVE = 0.05                 # mínimo mudança de preço (0.05 = 5%)
