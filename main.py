@@ -7,50 +7,64 @@ TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 bot = telebot.TeleBot(TOKEN)
+GAMMA = "https://gamma-api.polymarket.com/markets"
+
+# memória simples (guarda último preço)
+ULTIMO_PRECO = {}
 
 def enviar(msg):
     bot.send_message(CHAT_ID, msg, disable_web_page_preview=True)
 
 def buscar_mercados():
-    r = requests.get(
-        "https://gamma-api.polymarket.com/markets",
-        params={"limit": 200},
-        timeout=30
-    )
+    r = requests.get(GAMMA, params={"limit": 200}, timeout=30)
     return r.json()
 
-def filtrar(mercados):
-    bons = []
+def analisar():
+    mercados = buscar_mercados()
+
     for m in mercados:
         if m.get("closed"):
             continue
 
-        volume = m.get("volume", 0)
-        liquidez = m.get("liquidity", 0)
+        prices = m.get("outcomePrices")
+        if not prices:
+            continue
 
-        if volume and liquidez and volume > 10000 and liquidez > 5000:
-            bons.append(m)
+        preco = float(prices[0])  # SIM
+        market_id = m.get("id")
 
-    return bons[:5]
+        # primeira vez: só salva
+        if market_id not in ULTIMO_PRECO:
+            ULTIMO_PRECO[market_id] = preco
+            continue
 
-enviar("🤖 Bot ligado. Vou mandar sugestões do Polymarket.")
+        preco_antigo = ULTIMO_PRECO[market_id]
+        variacao = abs(preco - preco_antigo)
 
-while True:
-    try:
-        mercados = buscar_mercados()
-        bons = filtrar(mercados)
+        # só alerta se mudou "bastante"
+        if variacao >= 0.05:
+            titulo = m.get("question", "Mercado")
+            slug = m.get("slug", "")
+            link = f"https://polymarket.com/market/{slug}"
 
-        if not bons:
-            enviar("🔎 Nenhuma oportunidade agora.")
-        else:
-            enviar("📊 Sugestões do Polymarket:")
-            for m in bons:
-                titulo = m.get("question", "Mercado")
-                slug = m.get("slug", "")
-                link = f"https://polymarket.com/market/{slug}"
-                enviar(f"• {titulo}\n{link}")
+            enviar(
+                f"🚨 Movimento detectado\n"
+                f"{titulo}\n"
+                f"Preço mudou de {preco_antigo:.2f} → {preco:.2f}\n"
+                f"{link}"
+            )
 
-    except Exception as e:
-        enviar(f"Erro: {e}")
+            ULTIMO_PRECO[market_id] = preco
 
-    time.sleep(900)
+def main():
+    enviar("🤖 Bot ligado (modo: alerta por movimento de preço).")
+    while True:
+        try:
+            analisar()
+        except Exception as e:
+            enviar(f"Erro: {e}")
+
+        time.sleep(900)  # 15 min
+
+if __name__ == "__main__":
+    main()
