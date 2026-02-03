@@ -1,2 +1,4 @@
+aiohttp
+pyTelegramBotAPI
 requests
-pytelegrambotapi
+python-dotenv
