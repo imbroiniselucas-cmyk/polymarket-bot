@@ -25,24 +25,17 @@ def enviar(msg: str):
         print("Falha ao enviar:", repr(e))
 
 # ======================
-# CONFIG (meio-termo)
+# CONFIG (meio-termo + 2 níveis)
 # ======================
-# filtros de "onde vale olhar"
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", "300000"))
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "20000"))
 MARKETS_LIMIT = int(os.getenv("MARKETS_LIMIT", "250"))
 
-# thresholds de arbitragem (profit mínimo garantido)
-# exemplo: 0.02 = 2% (comprar 1.00 por <= 0.98)
-MIN_GUARANTEED_PROFIT = float(os.getenv("MIN_GUARANTEED_PROFIT", "0.02"))
+ALERT_PROFIT = float(os.getenv("ALERT_PROFIT", "0.02"))      # 2%
+WATCH_PROFIT = float(os.getenv("WATCH_PROFIT", "0.01"))      # 1%
 
-# quantos alerts por ciclo
 MAX_ALERTS = int(os.getenv("MAX_ALERTS", "10"))
-
-# intervalo
 SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "900"))
-
-# anti-spam: não repetir mesma oportunidade por X minutos
 SEEN_TTL_MIN = int(os.getenv("SEEN_TTL_MIN", "120"))
 
 # ======================
@@ -73,10 +66,7 @@ CLOB_BASE = "https://clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
 async def get_best_ask(session: aiohttp.ClientSession, token_id: str) -> float:
-    """
-    Retorna o melhor ASK (menor preço do lado de venda) do orderbook.
-    Esse é o preço real pra você COMPRAR.
-    """
+    """Melhor ASK = preço real para COMPRAR agora."""
     if not token_id:
         return 0.0
     url = f"{CLOB_BASE}/book?token_id={token_id}"
@@ -84,7 +74,6 @@ async def get_best_ask(session: aiohttp.ClientSession, token_id: str) -> float:
     asks = data.get("asks", [])
     if not asks:
         return 0.0
-    # asks vem como lista de {price, size} ou arrays dependendo do formato
     top = asks[0]
     if isinstance(top, dict):
         return to_float(top.get("price"))
@@ -93,13 +82,8 @@ async def get_best_ask(session: aiohttp.ClientSession, token_id: str) -> float:
     return 0.0
 
 def get_yes_no_token_ids(m: dict):
-    """
-    Gamma retorna clobTokenIds (normalmente alinhado com outcomes/outcomePrices).
-    Vamos tentar mapear outcomes => tokenId.
-    """
     outcomes = m.get("outcomes")
     token_ids = m.get("clobTokenIds")
-
     if not isinstance(outcomes, list) or not isinstance(token_ids, list):
         return ("", "")
     if len(outcomes) != len(token_ids):
@@ -116,12 +100,11 @@ def get_yes_no_token_ids(m: dict):
     return (yes_id, no_id)
 
 # ======================
-# Arb detectors
+# Date ladder helpers
 # ======================
 BY_DATE_RE = re.compile(r"\b(by|before)\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})\b", re.IGNORECASE)
 
 def normalize_base_question(q: str) -> str:
-    """Remove o 'by/before <date>' pra agrupar ladders."""
     q2 = BY_DATE_RE.sub("", q or "").strip()
     q2 = re.sub(r"\s+", " ", q2)
     return q2.lower()
@@ -131,7 +114,6 @@ def parse_date_from_question(q: str):
     if not m:
         return None
     raw = m.group(2).replace(",", "").strip()
-    # tenta formatos comuns: "March 31 2026"
     try:
         return datetime.strptime(raw, "%B %d %Y")
     except Exception:
@@ -140,7 +122,8 @@ def parse_date_from_question(q: str):
 # ======================
 # Anti-spam memory
 # ======================
-seen = {}  # key -> timestamp (epoch)
+seen = {}  # key -> epoch ts
+
 def now_ts():
     return int(datetime.utcnow().timestamp())
 
@@ -160,19 +143,38 @@ def cleanup_seen():
             del seen[k]
 
 # ======================
-# Main scan
+# Arb detectors
+# ======================
+def arb_level(guaranteed_profit: float) -> str:
+    """
+    Decide se vira ALERTA / WATCHLIST / IGNORAR.
+    """
+    if guaranteed_profit >= ALERT_PROFIT:
+        return "ALERTA"
+    if guaranteed_profit >= WATCH_PROFIT:
+        return "WATCHLIST"
+    return "IGNORAR"
+
+def fmt_money(x: float) -> str:
+    # 0.94 -> "0.9400"
+    return f"{x:.4f}"
+
+def fmt_pct(x: float) -> str:
+    # 0.06 -> "6.00%"
+    return f"{x*100:.2f}%"
+
+# ======================
+# Scan
 # ======================
 async def scan_arbs():
     cleanup_seen()
 
     async with aiohttp.ClientSession() as session:
-        # 1) pega mercados
         markets_url = f"{GAMMA_BASE}/markets?active=true&closed=false&limit={MARKETS_LIMIT}"
         markets = await fetch_json(session, markets_url)
         if not isinstance(markets, list):
             markets = markets.get("markets", [])
 
-        # filtra candidatos
         candidates = []
         for m in markets:
             q = (m.get("question") or "").strip()
@@ -195,46 +197,44 @@ async def scan_arbs():
                 "no_tid": no_tid,
             })
 
-        alerts = []
+        results = []
 
-        # =========================
-        # A) SAME-MARKET ARB
-        # =========================
+        # A) SAME-MARKET ARB: buy YES + buy NO < 1
         for m in candidates:
-            # best ask pra comprar YES e NO
             yes_ask = await get_best_ask(session, m["yes_tid"])
             no_ask  = await get_best_ask(session, m["no_tid"])
             if yes_ask <= 0 or no_ask <= 0:
                 continue
 
             cost = yes_ask + no_ask
-            guaranteed_profit = 1.0 - cost
+            gp = 1.0 - cost
+            level = arb_level(gp)
+            if level == "IGNORAR":
+                continue
 
-            if guaranteed_profit >= MIN_GUARANTEED_PROFIT:
-                key = f"same:{m['slug']}:{round(cost,4)}"
-                if seen_recently(key):
-                    continue
-                alerts.append({
-                    "type": "SAME_MARKET",
-                    "question": m["question"],
-                    "slug": m["slug"],
-                    "vol": m["volume"],
-                    "liq": m["liquidity"],
-                    "yes_ask": yes_ask,
-                    "no_ask": no_ask,
-                    "cost": cost,
-                    "guaranteed_profit": guaranteed_profit
-                })
-                mark_seen(key)
+            key = f"same:{m['slug']}:{round(cost,4)}:{level}"
+            if seen_recently(key):
+                continue
+            mark_seen(key)
 
-            if len(alerts) >= MAX_ALERTS:
+            results.append({
+                "level": level,
+                "type": "SAME_MARKET",
+                "question": m["question"],
+                "slug": m["slug"],
+                "vol": m["volume"],
+                "liq": m["liquidity"],
+                "yes_ask": yes_ask,
+                "no_ask": no_ask,
+                "cost": cost,
+                "gp": gp
+            })
+
+            if len(results) >= MAX_ALERTS:
                 break
 
-        if len(alerts) < MAX_ALERTS:
-            # =========================
-            # B) DATE-LADDER ARB
-            #    Buy NO (earlier) + Buy YES (later) < 1
-            # =========================
+        if len(results) < MAX_ALERTS:
+            # B) DATE-LADDER: buy NO (curto) + buy YES (longo) < 1
             ladders = {}
             for m in candidates:
                 dt = parse_date_from_question(m["question"])
@@ -246,96 +246,106 @@ async def scan_arbs():
             for base, items in ladders.items():
                 if len(items) < 2:
                     continue
-                items.sort(key=lambda x: x[0])  # por data
+                items.sort(key=lambda x: x[0])
 
-                # só checa pares (i<j): NO no curto + YES no longo
-                for i in range(len(items)-1):
-                    dt_i, m_i = items[i]
-                    no_ask_i = await get_best_ask(session, m_i["no_tid"])
-                    if no_ask_i <= 0:
+                for i in range(len(items) - 1):
+                    _, m_short = items[i]
+                    no_ask_short = await get_best_ask(session, m_short["no_tid"])
+                    if no_ask_short <= 0:
                         continue
 
-                    for j in range(i+1, len(items)):
-                        dt_j, m_j = items[j]
-                        yes_ask_j = await get_best_ask(session, m_j["yes_tid"])
-                        if yes_ask_j <= 0:
+                    for j in range(i + 1, len(items)):
+                        _, m_long = items[j]
+                        yes_ask_long = await get_best_ask(session, m_long["yes_tid"])
+                        if yes_ask_long <= 0:
                             continue
 
-                        cost = no_ask_i + yes_ask_j
-                        guaranteed_profit = 1.0 - cost
+                        cost = no_ask_short + yes_ask_long
+                        gp = 1.0 - cost
+                        level = arb_level(gp)
+                        if level == "IGNORAR":
+                            continue
 
-                        if guaranteed_profit >= MIN_GUARANTEED_PROFIT:
-                            key = f"ladder:{m_i['slug']}:{m_j['slug']}:{round(cost,4)}"
-                            if seen_recently(key):
-                                continue
-                            alerts.append({
-                                "type": "DATE_LADDER",
-                                "base": base,
-                                "short_q": m_i["question"],
-                                "short_slug": m_i["slug"],
-                                "long_q": m_j["question"],
-                                "long_slug": m_j["slug"],
-                                "short_no_ask": no_ask_i,
-                                "long_yes_ask": yes_ask_j,
-                                "cost": cost,
-                                "guaranteed_profit": guaranteed_profit,
-                                "vol": min(m_i["volume"], m_j["volume"]),
-                                "liq": min(m_i["liquidity"], m_j["liquidity"]),
-                            })
-                            mark_seen(key)
+                        key = f"ladder:{m_short['slug']}:{m_long['slug']}:{round(cost,4)}:{level}"
+                        if seen_recently(key):
+                            continue
+                        mark_seen(key)
 
-                        if len(alerts) >= MAX_ALERTS:
+                        results.append({
+                            "level": level,
+                            "type": "DATE_LADDER",
+                            "base": base,
+                            "short_q": m_short["question"],
+                            "short_slug": m_short["slug"],
+                            "long_q": m_long["question"],
+                            "long_slug": m_long["slug"],
+                            "short_no_ask": no_ask_short,
+                            "long_yes_ask": yes_ask_long,
+                            "cost": cost,
+                            "gp": gp,
+                            "vol": min(m_short["volume"], m_long["volume"]),
+                            "liq": min(m_short["liquidity"], m_long["liquidity"]),
+                        })
+
+                        if len(results) >= MAX_ALERTS:
                             break
-                    if len(alerts) >= MAX_ALERTS:
+                    if len(results) >= MAX_ALERTS:
                         break
-                if len(alerts) >= MAX_ALERTS:
+                if len(results) >= MAX_ALERTS:
                     break
 
-        return alerts
+        # Ordena priorizando ALERTA e maior profit
+        results.sort(key=lambda r: (1 if r["level"] == "ALERTA" else 0, r["gp"]), reverse=True)
+        return results[:MAX_ALERTS]
 
-def format_alert(a: dict) -> str:
-    gp = a["guaranteed_profit"]
-    cost = a["cost"]
-    gp_pct = round(gp * 100, 2)
-    cost_pct = round(cost * 100, 2)
+def format_result(r: dict) -> str:
+    tag = "🚨 <b>ALERTA</b>" if r["level"] == "ALERTA" else "👀 <b>WATCHLIST</b>"
+    cost = r["cost"]
+    gp = r["gp"]
 
-    if a["type"] == "SAME_MARKET":
+    if r["type"] == "SAME_MARKET":
         return (
-            f"💸 <b>ARB: YES+NO &lt; 1</b>\n"
-            f"📊 {a['question']}\n"
-            f"YES ask: {round(a['yes_ask'], 4)} | NO ask: {round(a['no_ask'], 4)}\n"
-            f"Total cost: {round(cost,4)} ({cost_pct}¢ por $1)\n"
-            f"✅ Profit mínimo: {round(gp,4)} ({gp_pct}%)\n"
-            f"Vol: {int(a['vol'])} | Liq: {int(a['liq'])}\n"
-            f"https://polymarket.com/market/{a['slug']}"
+            f"{tag} — <b>ARB YES+NO</b>\n"
+            f"📊 {r['question']}\n"
+            f"BUY YES @ {fmt_money(r['yes_ask'])} | BUY NO @ {fmt_money(r['no_ask'])}\n"
+            f"Total cost: {fmt_money(cost)}  | Profit: {fmt_money(gp)} ({fmt_pct(gp)})\n"
+            f"Vol: {int(r['vol'])} | Liq: {int(r['liq'])}\n"
+            f"https://polymarket.com/market/{r['slug']}"
         )
 
     # DATE_LADDER
     return (
-        f"💸 <b>ARB: DATE-LADDER (NO curto + YES longo)</b>\n"
-        f"🧩 Base: {a.get('base','')}\n\n"
-        f"1) <b>BUY NO</b> (curto): {a['short_q']}\n"
-        f"   ask(NO): {round(a['short_no_ask'],4)}\n"
-        f"   https://polymarket.com/market/{a['short_slug']}\n\n"
-        f"2) <b>BUY YES</b> (longo): {a['long_q']}\n"
-        f"   ask(YES): {round(a['long_yes_ask'],4)}\n"
-        f"   https://polymarket.com/market/{a['long_slug']}\n\n"
-        f"Total cost: {round(cost,4)} ({cost_pct}¢ por $1)\n"
-        f"✅ Profit mínimo: {round(gp,4)} ({gp_pct}%)\n"
-        f"Vol(min): {int(a['vol'])} | Liq(min): {int(a['liq'])}"
+        f"{tag} — <b>ARB DATE-LADDER</b>\n"
+        f"🧩 Base: {r.get('base','')}\n\n"
+        f"1) <b>BUY NO</b> (curto) @ {fmt_money(r['short_no_ask'])}\n"
+        f"   {r['short_q']}\n"
+        f"   https://polymarket.com/market/{r['short_slug']}\n\n"
+        f"2) <b>BUY YES</b> (longo) @ {fmt_money(r['long_yes_ask'])}\n"
+        f"   {r['long_q']}\n"
+        f"   https://polymarket.com/market/{r['long_slug']}\n\n"
+        f"Total cost: {fmt_money(cost)}  | Profit: {fmt_money(gp)} ({fmt_pct(gp)})\n"
+        f"Vol(min): {int(r['vol'])} | Liq(min): {int(r['liq'])}"
     )
 
+# ======================
+# LOOP
+# ======================
 async def main():
-    enviar("🤖 ArbBot ligado: procurando arbs (YES+NO<1 e date-ladders).")
+    enviar("🤖 ArbBot ligado (2 níveis): ALERTA ≥2% | WATCHLIST 1–2%")
     while True:
         try:
-            alerts = await scan_arbs()
-            if alerts:
-                enviar(f"🚨 <b>ARBS encontrados:</b> {len(alerts)}")
-                for a in alerts[:MAX_ALERTS]:
-                    enviar(format_alert(a))
+            res = await scan_arbs()
+            if not res:
+                enviar("🤖 Nenhum arb ≥1% agora. (Watch/Alert)")
             else:
-                enviar("🤖 Nenhum arb acima do threshold agora.")
+                # Envia um resumo e depois os detalhes
+                n_alert = sum(1 for x in res if x["level"] == "ALERTA")
+                n_watch = sum(1 for x in res if x["level"] == "WATCHLIST")
+                enviar(f"💡 Encontrados: 🚨 {n_alert} ALERTA | 👀 {n_watch} WATCHLIST")
+
+                for r in res:
+                    enviar(format_result(r))
+
         except Exception as e:
             enviar(f"❌ Erro no scan:\n<code>{e}</code>")
             print("Erro:", repr(e))
