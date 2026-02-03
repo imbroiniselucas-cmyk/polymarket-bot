@@ -25,6 +25,25 @@ def enviar(msg: str):
         print("Falha ao enviar no Telegram:", repr(e))
 
 
+def to_float(x) -> float:
+    """Converte int/float/str (tipo '1234.56') em float. Se falhar, retorna 0."""
+    if x is None:
+        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return 0.0
+        # remove separador de milhar caso venha tipo "1,234.56"
+        s = s.replace(",", "")
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
 async def fetch_json(url: str):
     async with aiohttp.ClientSession() as session:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=25)) as resp:
@@ -34,20 +53,23 @@ async def fetch_json(url: str):
 
 async def analisar_polymarket():
     try:
-        # ✅ Gamma API (mercados)
+        # Gamma API (mercados)
         url = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=200"
         data = await fetch_json(url)
 
-        # Gamma costuma retornar LISTA
         markets = data if isinstance(data, list) else data.get("markets", [])
+        if not isinstance(markets, list):
+            enviar("⚠️ Resposta inesperada da API (markets não é lista).")
+            return
 
         oportunidades = []
         for m in markets:
-            volume = m.get("volume", 0) or 0
-            liquidity = m.get("liquidity", 0) or 0
-            slug = m.get("slug", "") or ""
-            question = m.get("question", "Sem título") or "Sem título"
+            volume = to_float(m.get("volume"))
+            liquidity = to_float(m.get("liquidity"))
+            slug = (m.get("slug") or "").strip()
+            question = (m.get("question") or "Sem título").strip()
 
+            # Ajuste os thresholds aqui
             if volume > 200_000 and liquidity > 20_000 and slug:
                 oportunidades.append((volume, liquidity, question, slug))
 
