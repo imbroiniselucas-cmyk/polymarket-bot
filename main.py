@@ -1,484 +1,526 @@
 import os
+import re
 import time
 import json
 import math
-import requests
-import telebot
-from datetime import datetime
-from collections import deque
+import asyncio
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+import aiohttp
 
 # =========================
-# ENV
+# CONFIG
 # =========================
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-if not TOKEN or not CHAT_ID:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-bot = telebot.TeleBot(TOKEN)
+# Varredura
+SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "120"))  # ex: 2 min
+MAX_MARKETS = int(os.getenv("MAX_MARKETS", "250"))                # limita carga
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "2000"))         # filtra cedo
+MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "5000"))       # filtra cedo
 
-GAMMA_BASE = "https://gamma-api.polymarket.com"
-MARKETS_URL = f"{GAMMA_BASE}/markets"
-TAGS_URL = f"{GAMMA_BASE}/tags"
+# Oportunidade
+MIN_GAP = float(os.getenv("MIN_GAP", "0.06"))                     # 6%+
+MIN_SCORE = float(os.getenv("MIN_SCORE", "1.2"))                  # score mínimo
 
-# =========================
-# SETTINGS (mais filtrado)
-# =========================
-SCAN_SECONDS = int(os.environ.get("SCAN_SECONDS", "30"))
+# Anti-spam (não repetir o mesmo mercado toda hora)
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "3600"))     # 1h
 
-# filtros de mercado (reduz muito o ruído)
-MIN_LIQUIDITY = float(os.environ.get("MIN_LIQUIDITY", "10000"))
-MIN_VOLUME = float(os.environ.get("MIN_VOLUME", "80000"))
-
-# odds extremas fora
-MIN_YES_PRICE = float(os.environ.get("MIN_YES_PRICE", "0.10"))
-MAX_YES_PRICE = float(os.environ.get("MAX_YES_PRICE", "0.90"))
-
-# gatilhos "adultos"
-PRICE_MOVE_PCT = float(os.environ.get("PRICE_MOVE_PCT", "0.015"))  # 1.5%
-MIN_ABS_MOVE = float(os.environ.get("MIN_ABS_MOVE", "0.030"))      # 0.03
-VOLUME_JUMP = float(os.environ.get("VOLUME_JUMP", "5000"))         # +5000
-
-# histórico 1h
-HIST_POINTS = int(os.environ.get("HIST_POINTS", str(max(60, int(3600 / max(5, SCAN_SECONDS))))))
-MIN_RANGE_PCT = float(os.environ.get("MIN_RANGE_PCT", "0.05"))  # 5% range na última hora
-
-# filtro por volatilidade do próprio market (corta micro-ruído)
-USE_VOL_FILTER = os.environ.get("USE_VOL_FILTER", "1") == "1"
-VOL_SIGMA_MULT = float(os.environ.get("VOL_SIGMA_MULT", "3.0"))
-MIN_POINTS_FOR_VOL = int(os.environ.get("MIN_POINTS_FOR_VOL", "60"))
-
-# score mínimo (régua final)
-SCORE_MIN = float(os.environ.get("SCORE_MIN", "12.0"))
-
-# anti-spam por mercado
-COOLDOWN_MIN = int(os.environ.get("COOLDOWN_MIN", "20"))  # 20 min
-
-# limites
-MAX_ALERTS_PER_SCAN = int(os.environ.get("MAX_ALERTS_PER_SCAN", "3"))
-
-# status/health
-STATUS_EVERY_SCANS = int(os.environ.get("STATUS_EVERY_SCANS", "10"))
-HEALTH_EVERY_MIN = int(os.environ.get("HEALTH_EVERY_MIN", "15"))
-
-DEBUG = os.environ.get("DEBUG", "1") == "1"
-
-# excluir sports
-EXCLUDE_SPORTS = os.environ.get("EXCLUDE_SPORTS", "1") == "1"
-SPORTS_TAG_SLUG = os.environ.get("SPORTS_TAG_SLUG", "sports").strip().lower()
+# Concurrency
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "12"))
 
 # =========================
-# STATE
+# UTILS
 # =========================
-last_state = {}   # market_id -> {"price": float, "volume": float, "ts": float}
-cooldowns = {}    # market_id -> last_sent_ts
 
-price_hist = {}   # market_id -> deque(prices)
-vol_hist = {}     # market_id -> deque(volumes)
+@dataclass
+class Market:
+    id: str
+    question: str
+    url: str
+    category: str
+    best_yes: Optional[float]  # prob implícita (ou preço do YES normalizado)
+    liquidity: float
+    volume_24h: float
+    end_time: Optional[str] = None
 
-start_ts = time.time()
-scan_count = 0
-alert_count = 0
-last_health_ts = 0
-sports_tag_id = None
 
-# =========================
-# HELPERS
-# =========================
-def now_ts() -> float:
-    return time.time()
+class TTLCache:
+    """Cache simples com TTL (em memória) para evitar repetir chamadas externas."""
+    def __init__(self, ttl_seconds: int):
+        self.ttl = ttl_seconds
+        self.store: Dict[str, Tuple[float, Any]] = {}
 
-def fmt_time(ts: float) -> str:
-    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-
-def send(msg: str):
-    bot.send_message(CHAT_ID, msg, disable_web_page_preview=True)
-
-def log(msg: str):
-    if DEBUG:
-        print(msg, flush=True)
-
-def get_num(obj, key, default=0.0) -> float:
-    try:
-        return float(obj.get(key, default) or default)
-    except Exception:
-        return float(default)
-
-def parse_outcome_prices(raw):
-    if raw is None:
-        return None
-    if isinstance(raw, list):
-        try:
-            return [float(x) for x in raw]
-        except Exception:
+    def get(self, key: str):
+        v = self.store.get(key)
+        if not v:
             return None
-    if isinstance(raw, str):
-        s = raw.strip()
+        t, data = v
+        if time.time() - t > self.ttl:
+            self.store.pop(key, None)
+            return None
+        return data
+
+    def set(self, key: str, value: Any):
+        self.store[key] = (time.time(), value)
+
+
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
+def safe_float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+# =========================
+# TELEGRAM
+# =========================
+async def telegram_send(session: aiohttp.ClientSession, text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        # Se não tiver token/chat_id, só printa
+        print(text)
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True
+    }
+    async with session.post(url, json=payload, timeout=HTTP_TIMEOUT) as r:
+        if r.status >= 400:
+            body = await r.text()
+            print("Telegram error:", r.status, body)
+
+
+# =========================
+# POLYMARKET FETCH (CLOB-ish)
+# =========================
+async def fetch_json(session: aiohttp.ClientSession, url: str, params: Optional[dict] = None) -> Any:
+    async with session.get(url, params=params, timeout=HTTP_TIMEOUT) as r:
+        r.raise_for_status()
+        return await r.json()
+
+
+async def fetch_polymarket_markets(session: aiohttp.ClientSession) -> List[Market]:
+    """
+    Tenta buscar mercados com filtros básicos.
+    Ajuste o endpoint se o seu Polymarket estiver diferente.
+    """
+    # Endpoint CLOB “markets”
+    # (Se falhar, você substitui por outro endpoint que você já estiver usando)
+    base = "https://clob.polymarket.com"
+    url = f"{base}/markets"
+
+    # Alguns endpoints aceitam "limit" e "next_cursor".
+    params = {"limit": MAX_MARKETS}
+
+    data = await fetch_json(session, url, params=params)
+
+    # Normalização defensiva (porque estrutura varia)
+    raw_markets = data.get("data") or data.get("markets") or data
+
+    markets: List[Market] = []
+    for m in raw_markets[:MAX_MARKETS]:
+        q = (m.get("question") or m.get("title") or "").strip()
+        if not q:
+            continue
+
+        # Liquidez / volume podem vir com nomes diferentes
+        liquidity = safe_float(m.get("liquidity") or m.get("liquidityNum") or m.get("liquidityUSD") or 0)
+        volume_24h = safe_float(m.get("volume24h") or m.get("volume_24h") or m.get("volume") or 0)
+
+        # Filtros cedo (performance)
+        if liquidity < MIN_LIQUIDITY or volume_24h < MIN_VOLUME_24H:
+            continue
+
+        mid = str(m.get("market_id") or m.get("id") or "")
+        if not mid:
+            continue
+
+        slug = m.get("slug") or mid
+        url_market = m.get("url") or f"https://polymarket.com/market/{slug}"
+
+        category = (m.get("category") or m.get("categories") or "other")
+        if isinstance(category, list):
+            category = category[0] if category else "other"
+        category = str(category).lower()
+
+        # Prob do YES:
+        # Em alguns formatos vem como preço/odd. Aqui tentamos achar algo do tipo "best_bid"/"best_ask" do YES.
+        best_yes = None
+        # Tenta campos comuns
+        best_yes = m.get("best_yes") or m.get("yesPrice") or m.get("probability") or None
+        best_yes = safe_float(best_yes, default=None) if best_yes is not None else None
+        if best_yes is not None:
+            best_yes = clamp01(best_yes)
+
+        end_time = m.get("end_time") or m.get("endTime") or m.get("resolve_time") or None
+
+        markets.append(Market(
+            id=mid,
+            question=q,
+            url=url_market,
+            category=category,
+            best_yes=best_yes,
+            liquidity=liquidity,
+            volume_24h=volume_24h,
+            end_time=end_time
+        ))
+
+    return markets
+
+
+# =========================
+# EXTERNAL FAIR VALUE ESTIMATORS
+# =========================
+weather_cache = TTLCache(ttl_seconds=15 * 60)  # 15 min cache
+crypto_cache = TTLCache(ttl_seconds=60)        # 1 min cache
+
+# Heurísticas simples (você pode evoluir)
+WEATHER_PATTERNS = [
+    r"\btemperature\b", r"\btemp\b", r"\brain\b", r"\bsnow\b", r"\bwind\b",
+    r"\bstorm\b", r"\bhurricane\b", r"\bprecip\b", r"\bweather\b"
+]
+CLIMATE_PATTERNS = [
+    r"\bclimate\b", r"\bco2\b", r"\bemissions\b", r"\bcarbon\b", r"\bwarming\b"
+]
+CRYPTO_PATTERNS = [
+    r"\bbitcoin\b", r"\bbtc\b", r"\bethereum\b", r"\beth\b", r"\bsolana\b", r"\bsol\b"
+]
+
+
+def is_weather_market(q: str) -> bool:
+    s = q.lower()
+    return any(re.search(p, s) for p in WEATHER_PATTERNS)
+
+def is_climate_market(q: str) -> bool:
+    s = q.lower()
+    return any(re.search(p, s) for p in CLIMATE_PATTERNS)
+
+def is_crypto_market(q: str) -> bool:
+    s = q.lower()
+    return any(re.search(p, s) for p in CRYPTO_PATTERNS)
+
+
+def extract_city_hint(q: str) -> Optional[str]:
+    """
+    Heurística: tenta pegar algo após 'in ' ou 'at '.
+    Melhorar depois com uma lista de cidades/regex.
+    """
+    s = q.strip()
+    m = re.search(r"\b(in|at)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)", s)
+    if m:
+        return m.group(2)
+    return None
+
+
+async def fair_value_weather(session: aiohttp.ClientSession, market: Market) -> Optional[float]:
+    """
+    Retorna um 'fair probability' estimado para mercados de clima.
+    Sem NLP pesado: usa Open-Meteo só quando consegue inferir cidade.
+    Se não der para inferir, retorna None.
+    """
+    city = extract_city_hint(market.question)
+    if not city:
+        return None
+
+    cache_key = f"weather:{city}"
+    cached = weather_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Geocoding via Open-Meteo (grátis)
+    geo_url = "https://geocoding-api.open-meteo.com/v1/search"
+    geo = await fetch_json(session, geo_url, params={"name": city, "count": 1, "language": "en", "format": "json"})
+    results = geo.get("results") or []
+    if not results:
+        weather_cache.set(cache_key, None)
+        return None
+
+    lat = results[0]["latitude"]
+    lon = results[0]["longitude"]
+
+    # Forecast básico (7 dias) — exemplo. (Você pode ajustar com base na data do mercado.)
+    fc_url = "https://api.open-meteo.com/v1/forecast"
+    fc = await fetch_json(session, fc_url, params={
+        "latitude": lat, "longitude": lon,
+        "daily": "precipitation_probability_max,temperature_2m_max",
+        "timezone": "UTC"
+    })
+
+    daily = fc.get("daily") or {}
+    # Heurística: se a pergunta tiver "rain", usa prob precip. Senão tenta temp.
+    q = market.question.lower()
+
+    if "rain" in q or "precip" in q or "snow" in q or "storm" in q:
+        probs = daily.get("precipitation_probability_max") or []
+        if not probs:
+            weather_cache.set(cache_key, None)
+            return None
+        # usa o maior valor dos próximos dias como proxy (simples)
+        fair = clamp01(max(probs) / 100.0)
+    elif "temp" in q or "temperature" in q:
+        temps = daily.get("temperature_2m_max") or []
+        if not temps:
+            weather_cache.set(cache_key, None)
+            return None
+        # Sem o threshold do mercado (ex "above 30C"), não dá para calcular prob real.
+        # Proxy: normaliza a temperatura vs faixa (0..40C) (heurístico)
+        fair = clamp01((max(temps) - 0.0) / 40.0)
+    else:
+        weather_cache.set(cache_key, None)
+        return None
+
+    weather_cache.set(cache_key, fair)
+    return fair
+
+
+async def fair_value_crypto(session: aiohttp.ClientSession, market: Market) -> Optional[float]:
+    """
+    Heurística rápida para crypto:
+    - Se o mercado menciona "above $X by DATE", você pode estimar fair com volatilidade implícita (mais complexo).
+    - Aqui: proxy simples com momentum 24h do CoinGecko (não é “preciso”, mas funciona como baseline).
+    """
+    q = market.question.lower()
+    coin = None
+    if "bitcoin" in q or re.search(r"\bbtc\b", q):
+        coin = "bitcoin"
+    elif "ethereum" in q or re.search(r"\beth\b", q):
+        coin = "ethereum"
+    elif "solana" in q or re.search(r"\bsol\b", q):
+        coin = "solana"
+    if not coin:
+        return None
+
+    cache_key = f"cg:{coin}"
+    cached = crypto_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    data = await fetch_json(session, url, params={
+        "ids": coin,
+        "vs_currencies": "usd",
+        "include_24hr_change": "true"
+    })
+    chg = safe_float(data.get(coin, {}).get("usd_24h_change"), 0.0)
+
+    # Proxy: muda prob em função do momentum. (capado)
+    fair = clamp01(0.5 + (chg / 100.0) * 0.8)  # 24h +10% => +0.08
+    crypto_cache.set(cache_key, fair)
+    return fair
+
+
+async def fair_value_generic(session: aiohttp.ClientSession, market: Market) -> Optional[float]:
+    """
+    Para “outros mercados”: sem fonte externa, tenta detectar oportunidades
+    só com microestrutura: gaps + liquidez/volume + prob extrema.
+    Retorna um fair-value fraco (None) e deixa o score depender mais de microstructure.
+    """
+    return None
+
+
+# =========================
+# SCORING
+# =========================
+def microstructure_score(market: Market) -> float:
+    """
+    Score baseado só em liquidez/volume (para priorizar mercados bons).
+    """
+    # logs para não explodir
+    v = math.log1p(max(0.0, market.volume_24h))
+    l = math.log1p(max(0.0, market.liquidity))
+    return 0.6 * v + 0.4 * l
+
+
+def opportunity_score(pm_prob: float, fair_prob: Optional[float], market: Market) -> Tuple[float, float]:
+    """
+    Retorna (gap, score_total).
+    Se não tiver fair_prob, score depende só de microestrutura + prob extrema.
+    """
+    ms = microstructure_score(market)
+
+    if fair_prob is None:
+        # Oportunidade “estrutura”: preço muito extremo + mercado forte
+        extreme = abs(pm_prob - 0.5) * 2.0  # 0..1
+        score = ms * (0.6 + 0.8 * extreme)
+        gap = 0.0
+        return gap, score
+
+    gap = abs(pm_prob - fair_prob)
+    # gap * microstructure, com peso extra para gap
+    score = (gap * 5.0) * (0.4 + ms / 5.0)
+    return gap, score
+
+
+# =========================
+# ANTI-SPAM
+# =========================
+class CooldownDB:
+    """
+    Guarda último alert por market_id (em arquivo json).
+    """
+    def __init__(self, path: str = "cooldown.json"):
+        self.path = path
+        self.data: Dict[str, int] = {}
+        self._load()
+
+    def _load(self):
         try:
-            val = json.loads(s)
-            if isinstance(val, list):
-                return [float(x) for x in val]
+            with open(self.path, "r", encoding="utf-8") as f:
+                self.data = json.load(f)
+        except Exception:
+            self.data = {}
+
+    def save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f)
         except Exception:
             pass
-        try:
-            parts = [p.strip() for p in s.strip("[]").split(",")]
-            nums = [float(p) for p in parts if p]
-            return nums if nums else None
-        except Exception:
-            return None
-    return None
 
-def get_yes_price(m):
-    prices = parse_outcome_prices(m.get("outcomePrices"))
-    if not prices or len(prices) < 1:
+    def can_alert(self, market_id: str) -> bool:
+        last = self.data.get(market_id)
+        if not last:
+            return True
+        return (now_ts() - last) >= COOLDOWN_SECONDS
+
+    def mark_alerted(self, market_id: str):
+        self.data[market_id] = now_ts()
+
+
+# =========================
+# PIPELINE
+# =========================
+async def analyze_market(session: aiohttp.ClientSession, market: Market) -> Optional[Dict[str, Any]]:
+    # Se não tem prob do YES, não dá pra comparar
+    if market.best_yes is None:
         return None
-    try:
-        return float(prices[0])
-    except Exception:
+
+    q = market.question
+
+    # Decide estimator
+    fair = None
+    if is_weather_market(q) or is_climate_market(q):
+        fair = await fair_value_weather(session, market)
+    elif is_crypto_market(q):
+        fair = await fair_value_crypto(session, market)
+    else:
+        fair = await fair_value_generic(session, market)
+
+    gap, score = opportunity_score(market.best_yes, fair, market)
+
+    # Regras de corte
+    # - Se tem fair: exige gap mínimo
+    # - Sempre exige score mínimo
+    if fair is not None and gap < MIN_GAP:
+        return None
+    if score < MIN_SCORE:
         return None
 
-def market_link(m):
-    slug = (m.get("slug") or "").strip()
-    return f"https://polymarket.com/market/{slug}" if slug else "https://polymarket.com"
-
-def push_hist(dct, key, value, maxlen):
-    dq = dct.get(key)
-    if dq is None:
-        dq = deque(maxlen=maxlen)
-        dct[key] = dq
-    dq.append(value)
-    return dq
-
-def mean(xs):
-    return sum(xs) / len(xs) if xs else 0.0
-
-def stdev(xs):
-    if len(xs) < 2:
-        return 0.0
-    m = mean(xs)
-    var = sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
-    return math.sqrt(var)
-
-def hist_metrics(prices_deque):
-    if prices_deque is None or len(prices_deque) < 10:
-        return None
-    prices = list(prices_deque)
-    hi = max(prices)
-    lo = min(prices)
-    if lo <= 0:
-        return None
-    range_pct = (hi - lo) / lo
-    cur = prices[-1]
-    pos = 0.5 if hi == lo else (cur - lo) / (hi - lo)
-    short = prices[-10:]
-    long = prices[-60:] if len(prices) >= 60 else prices
-    trend = mean(short) - mean(long)
-    return {"high": hi, "low": lo, "range_pct": range_pct, "pos": pos, "trend": trend}
-
-def movement_is_significant(price_hist_deque, abs_move):
-    if not USE_VOL_FILTER:
-        return True
-    if price_hist_deque is None or len(price_hist_deque) < MIN_POINTS_FOR_VOL:
-        return True
-    prices = list(price_hist_deque)
-    diffs = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
-    sigma = stdev(diffs)
-    if sigma <= 0:
-        return True
-    return abs_move >= (VOL_SIGMA_MULT * sigma)
-
-def can_send_market(market_id: str) -> bool:
-    last = cooldowns.get(market_id, 0)
-    return (now_ts() - last) >= (COOLDOWN_MIN * 60)
-
-def mark_sent_market(market_id: str):
-    cooldowns[market_id] = now_ts()
-
-def fetch_tag_id_by_slug(slug: str):
-    try:
-        r = requests.get(f"{TAGS_URL}/slug/{slug}", timeout=30)
-        r.raise_for_status()
-        t = r.json()
-        return int(t["id"])
-    except Exception:
-        pass
-    r = requests.get(TAGS_URL, params={"limit": 5000}, timeout=30)
-    r.raise_for_status()
-    tags = r.json()
-    for t in tags:
-        if (t.get("slug") or "").strip().lower() == slug:
-            return int(t["id"])
-    return None
-
-def market_has_tag_id(m, tag_id: int) -> bool:
-    if tag_id is None:
-        return False
-    tags = m.get("tags")
-    if isinstance(tags, list):
-        for t in tags:
-            try:
-                if int(t.get("id")) == int(tag_id):
-                    return True
-            except Exception:
-                continue
-    return False
-
-# =========================
-# RECOMENDAÇÃO SUPER CLARA
-# =========================
-def clear_action_line(hm, direction_up):
-    """
-    Retorna:
-      action (ESPERAR / DESCARTAR),
-      motive,
-      confirm_level,
-      invalid_level
-    """
-    if hm is None or hm["range_pct"] < MIN_RANGE_PCT:
-        return ("ESPERAR", "Sem histórico 1h suficiente", None, None)
-
-    lo, hi = hm["low"], hm["high"]
-    r = max(hi - lo, 1e-9)
-    pos = hm["pos"]
-
-    confirm = lo + 0.25 * r     # confirmação “reação”
-    invalid = lo - 0.005        # invalidação abaixo do low (buffer)
-    mid = lo + 0.50 * r
-    breakout = hi + 0.005
-
-    # FUNDO da 1h
-    if pos <= 0.15:
-        if direction_up:
-            return ("ESPERAR", "Saindo do FUNDO 1h", confirm, lo)
-        return ("DESCARTAR", "Queda no FUNDO 1h (não perseguir)", confirm, invalid)
-
-    # TOPO da 1h
-    if pos >= 0.85:
-        return ("ESPERAR", "Perto do TOPO 1h", breakout, mid)
-
-    # MEIO do range
-    return ("ESPERAR", "Meio do range 1h", mid, mid)
-
-def format_alert(m, oldp, newp, oldv, newv, hm, score):
-    title = m.get("question") or m.get("title") or "Mercado"
-    direction_up = newp > oldp
-    arrow = "⬆️" if direction_up else "⬇️"
-    momentum = "YES↑" if direction_up else "YES↓"
-
-    abs_move = abs(newp - oldp)
-    pct_move = (abs_move / oldp) if oldp > 0 else 0.0
-    dv = newv - oldv
-    liq = int(get_num(m, "liquidity", 0))
-    vol_total = int(get_num(m, "volume", 0))
-
-    action, motive, confirm_level, invalid_level = clear_action_line(hm, direction_up)
-
-    rules = ""
-    if confirm_level is not None and invalid_level is not None:
-        rules = f"REGRAS: só agir se YES>{confirm_level:.3f} por 2 min | se YES<{invalid_level:.3f} → DESCARTAR"
-    elif confirm_level is not None:
-        rules = f"REGRAS: só agir se YES>{confirm_level:.3f} por 2 min"
-
-    hist_txt = ""
-    if hm and hm["range_pct"] >= MIN_RANGE_PCT:
-        hist_txt = f"1H: low={hm['low']:.3f} high={hm['high']:.3f} pos={hm['pos']*100:.0f}%"
-
-    return (
-        f"🚨 ALERTA | {momentum} | score={score:.1f}\n"
-        f"AÇÃO AGORA: {action}\n"
-        f"MOTIVO: {motive}\n"
-        f"{rules}\n"
-        f"{hist_txt}\n\n"
-        f"{title}\n"
-        f"{arrow} {oldp:.3f} → {newp:.3f}  (Δ={abs_move:.3f}, {pct_move*100:.2f}%)\n"
-        f"ΔVol:+{int(dv)} | Liq:{liq} | VolTotal:{vol_total}\n"
-        f"{market_link(m)}"
-    )
-
-# =========================
-# HEALTH / STATUS
-# =========================
-def healthcheck():
-    global last_health_ts
-    now = now_ts()
-    if last_health_ts == 0:
-        last_health_ts = now
-        return
-    if (now - last_health_ts) >= (HEALTH_EVERY_MIN * 60):
-        uptime_min = int((now - start_ts) / 60)
-        send(
-            f"📡 Health\n"
-            f"Uptime: {uptime_min}m | Scans: {scan_count} | Alerts: {alert_count}\n"
-            f"Interval: {SCAN_SECONDS}s | hist_points={HIST_POINTS}"
-        )
-        last_health_ts = now
-
-# =========================
-# FETCH MARKETS (paginado)
-# =========================
-def fetch_markets_page(limit: int = 200, offset: int = 0):
-    params = {
-        "closed": "false",
-        "limit": int(limit),
-        "offset": int(offset),
-        "order": "volume24hr",
-        "ascending": "false",
+    return {
+        "id": market.id,
+        "question": market.question,
+        "url": market.url,
+        "category": market.category,
+        "pm_prob_yes": market.best_yes,
+        "fair_prob": fair,
+        "gap": gap,
+        "liquidity": market.liquidity,
+        "volume_24h": market.volume_24h,
+        "score": score
     }
-    r = requests.get(MARKETS_URL, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, dict) and "markets" in data:
-        return data["markets"]
-    return data
 
-# =========================
-# SCAN
-# =========================
-def scan_once():
-    global scan_count, alert_count
-    scan_count += 1
 
-    markets = []
-    try:
-        markets += fetch_markets_page(limit=200, offset=0)
-        markets += fetch_markets_page(limit=200, offset=200)
-    except Exception as e:
-        send(f"⚠️ Erro ao buscar mercados: {e}")
-        return
+async def scan_once(session: aiohttp.ClientSession, cooldown: CooldownDB):
+    markets = await fetch_polymarket_markets(session)
 
-    c_total = 0
-    c_active = 0
-    c_sports_out = 0
-    c_price = 0
-    c_ready = 0
-    candidates = []
+    # Concurrency control
+    sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
-    for m in markets:
-        c_total += 1
-        if m.get("active") is not True:
+    async def run_one(m: Market):
+        async with sem:
+            return await analyze_market(session, m)
+
+    tasks = [run_one(m) for m in markets]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    opportunities: List[Dict[str, Any]] = []
+    for r in results:
+        if isinstance(r, Exception):
             continue
-        c_active += 1
+        if r:
+            opportunities.append(r)
 
-        if EXCLUDE_SPORTS and sports_tag_id is not None and market_has_tag_id(m, sports_tag_id):
-            c_sports_out += 1
+    # Ordena por score desc
+    opportunities.sort(key=lambda x: x["score"], reverse=True)
+
+    # Envia só top N, respeitando cooldown
+    sent = 0
+    for op in opportunities[:10]:
+        if not cooldown.can_alert(op["id"]):
             continue
 
-        liq = get_num(m, "liquidity", 0)
-        vol_total = get_num(m, "volume", 0)
-        if liq < MIN_LIQUIDITY or vol_total < MIN_VOLUME:
-            continue
+        pm = op["pm_prob_yes"]
+        fair = op["fair_prob"]
+        gap = op["gap"]
+        score = op["score"]
 
-        price = get_yes_price(m)
-        if price is None:
-            continue
-        c_price += 1
-
-        if price < MIN_YES_PRICE or price > MAX_YES_PRICE:
-            continue
-
-        market_id = str(m.get("id", "")).strip()
-        if not market_id:
-            continue
-
-        if not can_send_market(market_id):
-            continue
-
-        ph = push_hist(price_hist, market_id, price, HIST_POINTS)
-        _ = push_hist(vol_hist, market_id, vol_total, HIST_POINTS)
-        hm = hist_metrics(ph)
-
-        if hm is not None and hm["range_pct"] < MIN_RANGE_PCT:
-            continue
-
-        prev = last_state.get(market_id)
-        t = now_ts()
-        if prev is None:
-            last_state[market_id] = {"price": price, "volume": vol_total, "ts": t}
-            continue
-
-        c_ready += 1
-        oldp = prev["price"]
-        oldv = prev["volume"]
-        last_state[market_id] = {"price": price, "volume": vol_total, "ts": t}
-
-        abs_move = abs(price - oldp)
-        pct_move = (abs_move / oldp) if oldp > 0 else 0.0
-        dv = vol_total - oldv
-
-        # filtros “duros”
-        if abs_move < MIN_ABS_MOVE:
-            continue
-        if pct_move < PRICE_MOVE_PCT:
-            continue
-        if dv < VOLUME_JUMP:
-            continue
-        if not movement_is_significant(ph, abs_move):
-            continue
-
-        # score final
-        score = (abs_move * 80) + (pct_move * 120) + (dv / 1500) + (liq / 20000)
-        if score < SCORE_MIN:
-            continue
-
-        candidates.append((score, m, oldp, price, oldv, vol_total, hm))
-
-    log(
-        f"[scan {scan_count}] total={c_total} active={c_active} sports_out={c_sports_out} "
-        f"price={c_price} ready={c_ready} cand={len(candidates)}"
-    )
-
-    if scan_count % STATUS_EVERY_SCANS == 0:
-        send(
-            f"🧾 Status | {fmt_time(now_ts())}\n"
-            f"active={c_active} sports_out={c_sports_out} ready={c_ready} cand={len(candidates)}\n"
-            f"Filtros: liq≥{int(MIN_LIQUIDITY)} vol≥{int(MIN_VOLUME)} abs≥{MIN_ABS_MOVE:.3f} "
-            f"pct≥{PRICE_MOVE_PCT*100:.2f}% dv≥{int(VOLUME_JUMP)} score≥{SCORE_MIN} cooldown={COOLDOWN_MIN}m"
-        )
-
-    if not candidates:
-        return
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    top = candidates[:MAX_ALERTS_PER_SCAN]
-
-    send(f"🔔 Scan: {len(top)} alerta(s) | {fmt_time(now_ts())}")
-
-    for score, m, oldp, newp, oldv, newv, hm in top:
-        market_id = str(m.get("id", "")).strip()
-        send(format_alert(m, oldp, newp, oldv, newv, hm, score))
-        mark_sent_market(market_id)
-        alert_count += 1
-
-# =========================
-# MAIN
-# =========================
-def main():
-    global sports_tag_id
-    send("🔎 Iniciando...")
-
-    if EXCLUDE_SPORTS:
-        sports_tag_id = fetch_tag_id_by_slug(SPORTS_TAG_SLUG)
-        if sports_tag_id is None:
-            send("⚠️ Não achei tag 'sports'. Vou seguir sem excluir por tag.")
+        if fair is None:
+            txt = (
+                f"📌 OPORTUNIDADE (microstructure)\n"
+                f"• {op['question']}\n"
+                f"• Prob(YES): {pm:.3f}\n"
+                f"• Liquidez: {op['liquidity']:.0f} | Vol24h: {op['volume_24h']:.0f}\n"
+                f"• Score: {score:.2f}\n"
+                f"{op['url']}"
+            )
         else:
-            send(f"✅ Excluindo sports: tag_id={sports_tag_id}")
+            txt = (
+                f"🚨 GAP DETECTADO\n"
+                f"• {op['question']}\n"
+                f"• Prob(YES): {pm:.3f}  vs  Fair: {fair:.3f}\n"
+                f"• Gap: {gap:.3f} | Score: {score:.2f}\n"
+                f"• Liquidez: {op['liquidity']:.0f} | Vol24h: {op['volume_24h']:.0f}\n"
+                f"{op['url']}"
+            )
 
-    send(
-        "🤖 Bot ligado (AÇÃO + MOTIVO super claros)\n"
-        f"Scan={SCAN_SECONDS}s | hist=1h (~{HIST_POINTS} pts)\n"
-        f"Filtros: liq≥{int(MIN_LIQUIDITY)} vol≥{int(MIN_VOLUME)} YES {MIN_YES_PRICE:.2f}-{MAX_YES_PRICE:.2f}\n"
-        f"Gatilhos: abs≥{MIN_ABS_MOVE:.3f} pct≥{PRICE_MOVE_PCT*100:.2f}% volΔ≥{int(VOLUME_JUMP)} score≥{SCORE_MIN}\n"
-        f"VolFilter: {'ON' if USE_VOL_FILTER else 'OFF'} (x{VOL_SIGMA_MULT}) | cooldown={COOLDOWN_MIN}m | max/scan={MAX_ALERTS_PER_SCAN}"
-    )
+        await telegram_send(session, txt)
+        cooldown.mark_alerted(op["id"])
+        sent += 1
 
-    while True:
-        try:
-            scan_once()
-            healthcheck()
-        except Exception as e:
-            send(f"⚠️ Erro: {e}")
-            log(f"ERROR: {e}")
-        time.sleep(SCAN_SECONDS)
+    if sent:
+        cooldown.save()
+
+
+async def main():
+    cooldown = CooldownDB()
+
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        # IMPORTANTÍSSIMO: sem “status a cada 10s”.
+        # Só roda scans no intervalo e manda msg apenas se achar oportunidade.
+        while True:
+            try:
+                await scan_once(session, cooldown)
+            except Exception as e:
+                # sem spam. só printa no log
+                print("scan error:", repr(e))
+
+            await asyncio.sleep(SCAN_EVERY_SECONDS)
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
