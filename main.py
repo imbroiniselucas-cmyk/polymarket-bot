@@ -2,711 +2,948 @@
 # -*- coding: utf-8 -*-
 
 """
-Polymarket ACTION-only bot with external signals (news/weather/crypto)
-
-What it does now:
-- ACTION-only alerts (no WATCH, no status spam)
-- Requires "edge": market implied probability vs external estimated probability
-- Confirmation: requires condition in 2 consecutive scans
-- Less aggressive: cooldowns + hourly cap + per-market cooldown
-
-Env vars:
-- TELEGRAM_TOKEN
-- TELEGRAM_CHAT_ID
-
-Optional tuning:
-- SCAN_SECONDS (default 90)
-- MIN_LIQ (default 50000)
-- EDGE_MIN_PCT (default 10)         # min divergence in probability points
-- CONFIRM_SCANS (default 2)         # consecutive scans to confirm before ACTION
-- PER_MARKET_COOLDOWN_SEC (default 2700) # 45 min
-- GLOBAL_COOLDOWN_SEC (default 240)      # 4 min
-- MAX_ALERTS_PER_HOUR (default 6)
-- MAX_ALERTS_PER_CYCLE (default 2)
-
-Notes:
-- News: uses RSS from Google News (no key). Heuristic scoring.
-- Weather: uses Open-Meteo (no key). City-level forecast (approx).
-- Crypto: uses CoinGecko (no key) + simple volatility estimate.
-
-This is designed to be "more opportunistic" than "momentum chasing".
+Polymarket Layered Bot (Scanner -> Intel -> Decision -> PaperTrade/Alerts)
+- No extra dependencies (only stdlib + requests)
+- Works well on Railway + Telegram
+- Default mode: SCANNER (shortlist + alerts)
+- Supports paper trading + daily report + midday check
 """
 
 import os
+import sys
 import time
 import json
 import math
-import re
+import sqlite3
+import traceback
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote_plus
-import xml.etree.ElementTree as ET
 
 import requests
 
-# ----------------------------
-# CONFIG
-# ----------------------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+# =========================
+# CONFIG (ENV VARS)
+# =========================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "90"))
+MODE = os.getenv("MODE", "SCANNER").strip().upper()  # SCANNER | MIDDAY | REPORT | NIGHT
+DRY_RUN = os.getenv("DRY_RUN", "1").strip()  # "1" => no real trades, only paper trades/logs
+DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 
-MIN_LIQ = float(os.getenv("MIN_LIQ", "50000"))
-EDGE_MIN_PCT = float(os.getenv("EDGE_MIN_PCT", "10"))  # probability points (e.g., 10 = 10%)
-CONFIRM_SCANS = int(os.getenv("CONFIRM_SCANS", "2"))
+# Polymarket APIs (public)
+GAMMA_BASE = os.getenv("GAMMA_BASE", "https://gamma-api.polymarket.com").strip()
+CLOB_BASE = os.getenv("CLOB_BASE", "https://clob.polymarket.com").strip()
 
-PER_MARKET_COOLDOWN_SEC = int(os.getenv("PER_MARKET_COOLDOWN_SEC", "2700"))  # 45 min
-GLOBAL_COOLDOWN_SEC = int(os.getenv("GLOBAL_COOLDOWN_SEC", "240"))           # 4 min
-MAX_ALERTS_PER_HOUR = int(os.getenv("MAX_ALERTS_PER_HOUR", "6"))
-MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "2"))
+# Scanner scope
+ACTIVE_ONLY = os.getenv("ACTIVE_ONLY", "1").strip() == "1"
+MAX_MARKETS_FETCH = int(os.getenv("MAX_MARKETS_FETCH", "400").strip())  # keep light on Railway
+CANDIDATES_TOP_N = int(os.getenv("CANDIDATES_TOP_N", "12").strip())
+MIN_SCORE = float(os.getenv("MIN_SCORE", "8.0").strip())
 
-STATE_PATH = os.getenv("STATE_PATH", "/tmp/poly_state.json")
+# Filters
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "15000").strip())
+MIN_VOL_DELTA = float(os.getenv("MIN_VOL_DELTA", "500").strip())  # volume change threshold (approx)
+MIN_PRICE_MOVE_PCT = float(os.getenv("MIN_PRICE_MOVE_PCT", "1.2").strip())  # abs % move in last snapshot window
+EDGE_MIN_PP = float(os.getenv("EDGE_MIN_PP", "5.0").strip())  # minimum edge in percentage points
+CONF_MIN = float(os.getenv("CONF_MIN", "0.62").strip())
 
-UA = "poly-edge-bot/2.0"
+# Anti-spam / cooldown
+ALERT_COOLDOWN_MIN = int(os.getenv("ALERT_COOLDOWN_MIN", "75").strip())
+REALERT_EDGE_BUMP_PP = float(os.getenv("REALERT_EDGE_BUMP_PP", "2.0").strip())
 
-GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+# Intel (optional): GDELT topic/news pulse
+USE_GDELT = os.getenv("USE_GDELT", "1").strip() == "1"
+GDELT_WINDOW_H = int(os.getenv("GDELT_WINDOW_H", "24").strip())
 
+# Paper trading behavior
+PAPER_EXIT_HOURS = float(os.getenv("PAPER_EXIT_HOURS", "6").strip())  # auto "exit" after N hours for metrics
+PAPER_STAKE_USD = float(os.getenv("PAPER_STAKE_USD", "10").strip())  # paper stake size for PnL calc (rough)
 
-# ----------------------------
-# TELEGRAM
-# ----------------------------
-def tg_send(msg: str) -> None:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(msg)
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(
-            url,
-            timeout=20,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": msg,
-                "disable_web_page_preview": True,
-            },
-        )
-    except Exception as e:
-        print("Telegram send error:", e)
+# HTTP
+TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "12").strip())
+UA = os.getenv("HTTP_UA", "Mozilla/5.0 (compatible; PolymarketLayerBot/1.0)")
 
-
-# ----------------------------
-# STATE
-# ----------------------------
-def load_state() -> Dict[str, Any]:
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {
-            "last_alert_ts": {},          # market_id -> epoch
-            "global_last_alert_ts": 0,
-            "hour_bucket": {},            # hour_key -> count
-            "confirm": {},                # market_id -> consecutive hits
-            "cache": {                    # small caches for APIs
-                "news": {},
-                "crypto": {},
-                "weather": {},
-            },
-        }
-
-
-def save_state(state: Dict[str, Any]) -> None:
-    try:
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False)
-    except Exception:
-        pass
-
-
-def hour_key(ts: float) -> str:
-    return time.strftime("%Y-%m-%dT%H", time.gmtime(ts))
-
-
-def global_hourly_cap_ok(state: Dict[str, Any], ts: float) -> bool:
-    key = hour_key(ts)
-    count = int(state.get("hour_bucket", {}).get(key, 0))
-    return count < MAX_ALERTS_PER_HOUR
-
-
-def bump_hourly_count(state: Dict[str, Any], ts: float) -> None:
-    key = hour_key(ts)
-    state.setdefault("hour_bucket", {})
-    state["hour_bucket"][key] = int(state["hour_bucket"].get(key, 0)) + 1
-
-
-def cooldown_ok(state: Dict[str, Any], market_id: str, ts: float) -> bool:
-    last_m = float(state.get("last_alert_ts", {}).get(market_id, 0))
-    if ts - last_m < PER_MARKET_COOLDOWN_SEC:
-        return False
-    last_g = float(state.get("global_last_alert_ts", 0))
-    if ts - last_g < GLOBAL_COOLDOWN_SEC:
-        return False
-    return True
-
-
-def mark_alert(state: Dict[str, Any], market_id: str, ts: float) -> None:
-    state.setdefault("last_alert_ts", {})
-    state["last_alert_ts"][market_id] = ts
-    state["global_last_alert_ts"] = ts
-    bump_hourly_count(state, ts)
-    # reset confirm counter after alert
-    state.setdefault("confirm", {})
-    state["confirm"][market_id] = 0
-
-
-# ----------------------------
-# HELPERS
-# ----------------------------
-def _to_float(x: Any) -> float:
-    try:
-        if x is None:
-            return 0.0
-        if isinstance(x, (int, float)):
-            return float(x)
-        return float(str(x).strip().replace(",", ""))
-    except Exception:
-        return 0.0
-
-
-def clean_title(s: str, n: int = 115) -> str:
-    s = re.sub(r"\s+", " ", (s or "").strip())
-    return s if len(s) <= n else s[: n - 1] + "…"
-
-
+# =========================
+# UTIL
+# =========================
 def now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
+def ts() -> int:
+    return int(time.time())
 
-def parse_dt_iso(s: str) -> Optional[dt.datetime]:
+def clamp(x: float, a: float, b: float) -> float:
+    return max(a, min(b, x))
+
+def safe_float(x: Any, default: float = 0.0) -> float:
     try:
-        if not s:
-            return None
-        # Gamma commonly returns ISO strings
-        # Examples: "2026-02-28T23:59:59Z" or with offset
-        if s.endswith("Z"):
-            s = s.replace("Z", "+00:00")
-        return dt.datetime.fromisoformat(s)
+        if x is None:
+            return default
+        return float(x)
     except Exception:
-        return None
+        return default
 
+def safe_int(x: Any, default: int = 0) -> int:
+    try:
+        if x is None:
+            return default
+        return int(float(x))
+    except Exception:
+        return default
 
-# ----------------------------
-# POLYMARKET FETCH
-# ----------------------------
-def fetch_markets(limit: int = 200) -> List[Dict[str, Any]]:
-    r = requests.get(
-        GAMMA_MARKETS_URL,
-        params={
-            "active": "true",
-            "closed": "false",
-            "limit": limit,
-            "offset": 0,
-            "order": "volume24hr",
-            "ascending": "false",
-        },
-        timeout=25,
-        headers={"User-Agent": UA},
-    )
+def http_get(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    r = requests.get(url, params=params, timeout=TIMEOUT, headers={"User-Agent": UA})
     r.raise_for_status()
-    raw = r.json()
-    return normalize_markets(raw)
+    ct = r.headers.get("content-type", "")
+    if "application/json" in ct or "json" in ct:
+        return r.json()
+    return r.text
 
+def http_post(url: str, payload: Dict[str, Any]) -> Any:
+    r = requests.post(url, json=payload, timeout=TIMEOUT, headers={"User-Agent": UA})
+    r.raise_for_status()
+    return r.json()
 
-def normalize_markets(raw: Any) -> List[Dict[str, Any]]:
+# =========================
+# TELEGRAM (no dependency)
+# =========================
+def tg_send(text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        # If no Telegram configured, just print
+        print(text)
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True
+    }
+    try:
+        requests.post(url, json=payload, timeout=TIMEOUT).raise_for_status()
+    except Exception:
+        # Don't crash the bot due to Telegram outage
+        print("Telegram send failed. Printing instead:\n", text)
+
+# =========================
+# DB
+# =========================
+def db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def db_init() -> None:
+    conn = db_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS markets_snapshot (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at INTEGER NOT NULL,
+        market_id TEXT NOT NULL,
+        slug TEXT,
+        question TEXT,
+        yes_price REAL,
+        no_price REAL,
+        liquidity REAL,
+        volume REAL,
+        end_time INTEGER,
+        active INTEGER
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS alerts_sent (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at INTEGER NOT NULL,
+        market_id TEXT NOT NULL,
+        slug TEXT,
+        edge_pp REAL,
+        score REAL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS paper_trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at INTEGER NOT NULL,
+        market_id TEXT NOT NULL,
+        slug TEXT,
+        side TEXT NOT NULL,
+        entry_price REAL NOT NULL,
+        stake_usd REAL NOT NULL,
+        exit_at INTEGER,
+        exit_price REAL,
+        pnl_usd REAL,
+        meta_json TEXT
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+def db_last_snapshot(market_id: str) -> Optional[sqlite3.Row]:
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM markets_snapshot
+        WHERE market_id=?
+        ORDER BY created_at DESC
+        LIMIT 1
+    """, (market_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def db_insert_snapshot(m: Dict[str, Any]) -> None:
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO markets_snapshot
+        (created_at, market_id, slug, question, yes_price, no_price, liquidity, volume, end_time, active)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+    """, (
+        ts(),
+        str(m.get("id", "")),
+        m.get("slug"),
+        m.get("question"),
+        safe_float(m.get("yes_price")),
+        safe_float(m.get("no_price")),
+        safe_float(m.get("liquidity")),
+        safe_float(m.get("volume")),
+        safe_int(m.get("end_time")),
+        1 if m.get("active") else 0
+    ))
+    conn.commit()
+    conn.close()
+
+def db_recent_alert(market_id: str) -> Optional[sqlite3.Row]:
+    cutoff = ts() - ALERT_COOLDOWN_MIN * 60
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM alerts_sent
+        WHERE market_id=? AND created_at>=?
+        ORDER BY created_at DESC
+        LIMIT 1
+    """, (market_id, cutoff))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def db_insert_alert(market_id: str, slug: str, edge_pp: float, score: float) -> None:
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO alerts_sent (created_at, market_id, slug, edge_pp, score)
+        VALUES (?,?,?,?,?)
+    """, (ts(), market_id, slug, edge_pp, score))
+    conn.commit()
+    conn.close()
+
+def db_open_paper_trades() -> List[sqlite3.Row]:
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM paper_trades
+        WHERE exit_at IS NULL
+        ORDER BY created_at ASC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def db_create_paper_trade(market_id: str, slug: str, side: str, entry_price: float, stake_usd: float, meta: Dict[str, Any]) -> None:
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO paper_trades (created_at, market_id, slug, side, entry_price, stake_usd, meta_json)
+        VALUES (?,?,?,?,?,?,?)
+    """, (ts(), market_id, slug, side, entry_price, stake_usd, json.dumps(meta, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+
+def db_close_paper_trade(trade_id: int, exit_price: float, pnl_usd: float) -> None:
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE paper_trades
+        SET exit_at=?, exit_price=?, pnl_usd=?
+        WHERE id=?
+    """, (ts(), exit_price, pnl_usd, trade_id))
+    conn.commit()
+    conn.close()
+
+def db_paper_stats(days: int = 7) -> Dict[str, Any]:
+    cutoff = ts() - days * 86400
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM paper_trades
+        WHERE created_at>=? AND exit_at IS NOT NULL
+        ORDER BY created_at ASC
+    """, (cutoff,))
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        return {"n": 0, "winrate": 0.0, "roi": 0.0, "pnl": 0.0, "avg_pnl": 0.0, "max_dd": 0.0}
+
+    pnl_list = [safe_float(r["pnl_usd"]) for r in rows]
+    stake_list = [safe_float(r["stake_usd"]) for r in rows]
+    total_pnl = sum(pnl_list)
+    total_stake = sum(stake_list) if sum(stake_list) > 0 else 1.0
+    roi = total_pnl / total_stake
+
+    wins = sum(1 for p in pnl_list if p > 0)
+    winrate = wins / len(pnl_list)
+
+    # max drawdown on cumulative pnl
+    cum = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for p in pnl_list:
+        cum += p
+        peak = max(peak, cum)
+        dd = peak - cum
+        max_dd = max(max_dd, dd)
+
+    return {
+        "n": len(pnl_list),
+        "winrate": winrate,
+        "roi": roi,
+        "pnl": total_pnl,
+        "avg_pnl": total_pnl / len(pnl_list),
+        "max_dd": max_dd
+    }
+
+# =========================
+# POLYMARKET DATA FETCH
+# =========================
+def fetch_markets(limit: int = 200, active_only: bool = True) -> List[Dict[str, Any]]:
+    """
+    Uses Gamma API /markets (public).
+    Note: response schema can include a lot; we normalize what we need.
+    """
+    params = {
+        "limit": limit,
+        "closed": "false",
+        "active": "true" if active_only else "false",
+        "order": "volume",
+        "ascending": "false"
+    }
+    url = f"{GAMMA_BASE}/markets"
+    data = http_get(url, params=params)
+
+    if not isinstance(data, list):
+        # Sometimes gamma returns {"markets": [...]} in other clients; handle both.
+        if isinstance(data, dict) and "markets" in data and isinstance(data["markets"], list):
+            data = data["markets"]
+        else:
+            return []
+
     out: List[Dict[str, Any]] = []
+    for m in data:
+        # Attempt to derive a readable question/title
+        q = m.get("question") or m.get("title") or m.get("name") or ""
+        slug = m.get("slug") or ""
+        mid = str(m.get("id") or m.get("market_id") or "")
 
-    raw_list = raw if isinstance(raw, list) else []
-    for m in raw_list:
-        try:
-            mid = str(m.get("id") or "")
-            if not mid:
-                continue
+        # Gamma markets often include "liquidity" and "volume" as strings/numbers.
+        liquidity = safe_float(m.get("liquidity") or m.get("liquidityNum") or m.get("liquidityUSD") or 0.0)
+        volume = safe_float(m.get("volume") or m.get("volumeNum") or m.get("volumeUSD") or 0.0)
 
-            question = (m.get("question") or m.get("title") or "").strip()
-            slug = (m.get("slug") or "").strip()
-            url = m.get("url") or (f"https://polymarket.com/market/{slug}" if slug else "")
+        # Some responses include outcomePrices list (e.g. ["0.31","0.69"])
+        yes_price = None
+        no_price = None
+        op = m.get("outcomePrices")
+        if isinstance(op, list) and len(op) >= 2:
+            # Convention: first outcome usually corresponds to first outcome label,
+            # often "Yes" then "No" in binary markets.
+            yes_price = safe_float(op[0])
+            no_price = safe_float(op[1])
+        else:
+            # Fallback fields sometimes exist
+            yes_price = safe_float(m.get("yesPrice"), 0.0)
+            no_price = safe_float(m.get("noPrice"), 0.0)
 
-            liquidity = _to_float(m.get("liquidity") or m.get("liquidityNum") or m.get("liquidityUSD") or 0)
-            volume24 = _to_float(m.get("volume24hr") or m.get("volume_24hr") or m.get("volume") or 0)
-
-            end_date = parse_dt_iso(m.get("endDate") or m.get("end_date") or m.get("closeTime") or "")
-
-            category = m.get("category") or ""
-            tags = m.get("tags") or ""
-            if isinstance(tags, list):
-                tags = ", ".join([str(x) for x in tags[:4]])
-
-            outcomes = []
-            if isinstance(m.get("outcomes"), str) and isinstance(m.get("outcomePrices"), str):
+        # Active/end times
+        end_time = 0
+        for k in ("endTime", "end_time", "closeTime", "closedTime", "expirationTime"):
+            if m.get(k):
                 try:
-                    names = json.loads(m["outcomes"])
-                    prices = json.loads(m["outcomePrices"])
-                    for n, p in zip(names, prices):
-                        outcomes.append({"name": str(n), "price": _to_float(p)})
+                    # Sometimes ISO string
+                    if isinstance(m.get(k), str) and "T" in m.get(k):
+                        end_time = int(dt.datetime.fromisoformat(m[k].replace("Z", "+00:00")).timestamp())
+                    else:
+                        end_time = safe_int(m.get(k))
                 except Exception:
-                    pass
+                    end_time = 0
+                break
 
-            if not question or not outcomes:
-                continue
+        active = bool(m.get("active", True)) and not bool(m.get("closed", False))
 
-            # choose YES/NO if present; else use leading outcome
-            out.append(
-                {
-                    "id": mid,
-                    "question": question,
-                    "url": url,
-                    "liq": liquidity,
-                    "vol24": volume24,
-                    "end": end_date.isoformat() if end_date else "",
-                    "category": str(category),
-                    "tags": str(tags),
-                    "outcomes": outcomes,
-                }
-            )
-        except Exception:
-            continue
-
+        out.append({
+            "id": mid,
+            "slug": slug,
+            "question": q.strip(),
+            "yes_price": yes_price,
+            "no_price": no_price,
+            "liquidity": liquidity,
+            "volume": volume,
+            "end_time": end_time,
+            "active": active,
+            "url": f"https://polymarket.com/market/{slug}" if slug else "https://polymarket.com"
+        })
     return out
 
-
-def pick_binary_yes_price(outcomes: List[Dict[str, Any]]) -> Optional[float]:
-    # Return YES price if market has YES/NO; else None
-    yes = None
-    no = None
-    for o in outcomes:
-        name = str(o.get("name", "")).strip().upper()
-        price = _to_float(o.get("price"))
-        if name == "YES":
-            yes = price
-        elif name == "NO":
-            no = price
-    if yes is None or no is None:
-        return None
-    if 0.0001 <= yes <= 0.9999:
-        return yes
-    return None
-
-
-# ----------------------------
-# CLASSIFICATION
-# ----------------------------
-def classify_market(m: Dict[str, Any]) -> str:
-    q = (m.get("question") or "").lower()
-    tags = (m.get("tags") or "").lower()
-    cat = (m.get("category") or "").lower()
-
-    # weather/climate
-    if any(k in q for k in ["temperature", "rain", "snow", "wind", "hurricane", "storm"]) or "weather" in tags:
-        return "weather"
-
-    # crypto
-    if any(k in q for k in ["bitcoin", "btc", "ethereum", "eth", "solana", "crypto", "doge", "price of"]) or "crypto" in tags:
-        return "crypto"
-
-    # politics/news
-    if any(k in q for k in ["election", "president", "prime minister", "congress", "senate", "bill", "law", "impeach", "resign", "indict", "ceasefire", "war", "nato"]) or "politics" in tags:
-        return "politics"
-
-    # default
-    return "general_news"
-
-
-# ----------------------------
-# EXTERNAL SIGNALS
-# ----------------------------
-def fetch_google_news_rss(query: str) -> List[Dict[str, str]]:
+# =========================
+# FEATURES / SCORE
+# =========================
+def compute_deltas(m: Dict[str, Any]) -> Dict[str, float]:
     """
-    No key. Returns items: title, link, pubDate (raw string)
+    Compare current snapshot with last DB snapshot for same market_id.
+    Returns deltas for volume and price movement (yes).
     """
-    url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
-    r = requests.get(url, timeout=20, headers={"User-Agent": UA})
-    r.raise_for_status()
-    root = ET.fromstring(r.text)
-    items = []
-    for item in root.findall(".//item"):
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        pub = (item.findtext("pubDate") or "").strip()
-        if title:
-            items.append({"title": title, "link": link, "pubDate": pub})
-    return items[:12]
+    last = db_last_snapshot(m["id"])
+    if not last:
+        return {"vol_delta": 0.0, "price_move_pct": 0.0}
 
+    vol0 = safe_float(last["volume"])
+    vol1 = safe_float(m.get("volume"))
+    vol_delta = vol1 - vol0
 
-def news_probability_heuristic(question: str, state: Dict[str, Any], ts: float) -> Tuple[Optional[float], str]:
+    p0 = safe_float(last["yes_price"])
+    p1 = safe_float(m.get("yes_price"))
+    price_move_pct = 0.0
+    if p0 > 0:
+        price_move_pct = ((p1 - p0) / p0) * 100.0
+
+    return {"vol_delta": vol_delta, "price_move_pct": price_move_pct}
+
+def score_market(m: Dict[str, Any], deltas: Dict[str, float]) -> float:
     """
-    Returns (probability_yes_estimate, explanation)
-    Heuristic: evidence score from RSS titles + recency.
+    Score 0-15 based on:
+    - Liquidity
+    - Volume delta
+    - Price movement
+    - Time to expiry (sooner = higher urgency)
     """
-    q = clean_title(question, 140)
+    liq = safe_float(m.get("liquidity"))
+    vol_delta = safe_float(deltas.get("vol_delta"))
+    pm = abs(safe_float(deltas.get("price_move_pct")))
 
-    # simple query extraction: take key nouns-ish words
-    tokens = re.findall(r"[A-Za-z0-9À-ÿ'-]{3,}", question)
-    # keep a small set
-    key = " ".join(tokens[:7]) if tokens else q
+    # Liquidity score (0-5)
+    liq_s = clamp(math.log10(liq + 1) - 3.0, 0.0, 5.0)  # ~ 10k => 1, 100k => 2, 1M => 3 etc.
 
-    cache = state.setdefault("cache", {}).setdefault("news", {})
-    cached = cache.get(key)
-    if cached and (ts - float(cached.get("ts", 0)) < 120):  # 2 min cache
-        return cached.get("p"), cached.get("why", "")
+    # Volume delta score (0-5)
+    vd_s = clamp(math.log10(max(vol_delta, 0) + 1) - 2.5, 0.0, 5.0)  # ~300 =>0, 3k=>1, 30k=>2
 
-    try:
-        items = fetch_google_news_rss(key)
-    except Exception:
-        cache[key] = {"ts": ts, "p": None, "why": "news fetch failed"}
-        return None, "news fetch failed"
+    # Price move score (0-3)
+    pm_s = clamp(pm / 2.0, 0.0, 3.0)  # 2% =>1, 6%=>3
 
-    # keyword scoring (titles only)
-    positive = [
-        "confirmed", "passes", "passed", "approved", "signed", "announces", "announced",
-        "wins", "win", "agrees", "agreement", "deal reached", "ceasefire agreed",
-        "indicted", "resigns", "resigned", "steps down", "appointed"
-    ]
-    negative = [
-        "fails", "blocked", "rejects", "rejected", "denies", "denied", "no evidence",
-        "unlikely", "setback", "postponed", "delayed", "falls short"
-    ]
-
-    score = 0.0
-    hits = 0
-    for it in items[:10]:
-        t = it["title"].lower()
-        s = 0.0
-        if any(k in t for k in positive):
-            s += 1.0
-        if any(k in t for k in negative):
-            s -= 1.0
-        if s != 0:
-            hits += 1
-            score += s
-
-    # map score -> probability (conservative!)
-    # baseline 0.5; push only if multiple hits
-    if hits == 0:
-        p = None
-        why = "no strong headline evidence"
+    # Urgency (0-2)
+    urg_s = 0.0
+    end_time = safe_int(m.get("end_time"))
+    if end_time > 0:
+        hours_left = (end_time - ts()) / 3600.0
+        if hours_left <= 24:
+            urg_s = 2.0
+        elif hours_left <= 72:
+            urg_s = 1.0
+        else:
+            urg_s = 0.5
     else:
-        # clamp
-        raw = 0.5 + (score / max(3.0, hits * 2.0))  # conservative scaling
-        p = float(max(0.1, min(0.9, raw)))
-        why = f"news headlines hits={hits}, score={score:.1f}"
+        urg_s = 0.5
 
-    cache[key] = {"ts": ts, "p": p, "why": why}
-    return p, why
+    score = liq_s + vd_s + pm_s + urg_s
+    return clamp(score, 0.0, 15.0)
 
+def pick_candidates(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    scored: List[Tuple[float, Dict[str, Any], Dict[str, float]]] = []
+    for m in markets:
+        deltas = compute_deltas(m)
+        sc = score_market(m, deltas)
 
-def open_meteo_max_temp(city: str, ts: float, state: Dict[str, Any]) -> Tuple[Optional[float], str]:
-    """
-    Uses Open-Meteo geocoding + forecast daily max temp.
-    Returns today's/tomorrow's max depending on question not parsed (simple).
-    """
-    cache = state.setdefault("cache", {}).setdefault("weather", {})
-    ck = f"om:{city.lower()}"
-    cached = cache.get(ck)
-    if cached and (ts - float(cached.get("ts", 0)) < 900):  # 15 min cache
-        return cached.get("tmax"), cached.get("why", "")
-
-    try:
-        geo = requests.get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": city, "count": 1, "language": "en", "format": "json"},
-            timeout=20,
-            headers={"User-Agent": UA},
-        ).json()
-        res = (geo.get("results") or [])
-        if not res:
-            cache[ck] = {"ts": ts, "tmax": None, "why": "geocode not found"}
-            return None, "geocode not found"
-        lat = res[0]["latitude"]
-        lon = res[0]["longitude"]
-
-        fc = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "daily": "temperature_2m_max",
-                "forecast_days": 2,
-                "timezone": "UTC",
-            },
-            timeout=20,
-            headers={"User-Agent": UA},
-        ).json()
-
-        temps = (((fc.get("daily") or {}).get("temperature_2m_max")) or [])
-        if not temps:
-            cache[ck] = {"ts": ts, "tmax": None, "why": "forecast missing"}
-            return None, "forecast missing"
-
-        # pick next-day max (more useful for "tomorrow" markets)
-        tmax = float(temps[1]) if len(temps) > 1 else float(temps[0])
-        why = f"Open-Meteo max≈{tmax:.1f}C (next day)"
-        cache[ck] = {"ts": ts, "tmax": tmax, "why": why}
-        return tmax, why
-    except Exception:
-        cache[ck] = {"ts": ts, "tmax": None, "why": "weather fetch failed"}
-        return None, "weather fetch failed"
-
-
-def weather_probability_heuristic(question: str, outcomes: List[Dict[str, Any]], state: Dict[str, Any], ts: float) -> Tuple[Optional[float], str]:
-    """
-    For weather markets, we often don't have buckets reliably in Gamma,
-    so we approximate only for binary style like:
-      "Will the highest temperature in London be above 10C?"
-    If question doesn't match, returns None.
-    """
-    q = question.lower()
-
-    m = re.search(r"above\s+(-?\d+)\s*°?\s*c", q)
-    if not m:
-        m = re.search(r"over\s+(-?\d+)\s*°?\s*c", q)
-    if not m:
-        return None, "weather: no 'above X C' pattern"
-
-    threshold = float(m.group(1))
-
-    # city: very rough extraction
-    city = None
-    for c in ["london", "paris", "berlin", "vienna", "amsterdam", "madrid", "rome", "lisbon"]:
-        if c in q:
-            city = c.title()
-            break
-    if not city:
-        return None, "weather: city not detected"
-
-    tmax, why_t = open_meteo_max_temp(city, ts, state)
-    if tmax is None:
-        return None, "weather: forecast unavailable"
-
-    # simple prob: if forecast above threshold by margin, increase probability
-    margin = tmax - threshold
-    # conservative mapping
-    if margin >= 2.0:
-        p = 0.75
-    elif margin >= 1.0:
-        p = 0.62
-    elif margin >= 0.0:
-        p = 0.52
-    elif margin >= -1.0:
-        p = 0.40
-    else:
-        p = 0.28
-
-    return float(p), f"weather: {why_t}, threshold={threshold}, margin={margin:+.1f}C"
-
-
-def coingecko_price_history(coin_id: str, days: int = 30) -> List[float]:
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    r = requests.get(url, params={"vs_currency": "usd", "days": days}, timeout=25, headers={"User-Agent": UA})
-    r.raise_for_status()
-    data = r.json()
-    prices = [float(p[1]) for p in (data.get("prices") or []) if isinstance(p, list) and len(p) >= 2]
-    return prices
-
-
-def crypto_probability_heuristic(question: str, state: Dict[str, Any], ts: float) -> Tuple[Optional[float], str]:
-    """
-    Handles basic binary like:
-    - "Will Bitcoin reach $90,000 in February?"
-    - "Will BTC be above $80,000 on Feb 3?"
-    Returns probability estimate using spot + realized vol approximation (very rough).
-    """
-    q = question.lower()
-    if "bitcoin" in q or re.search(r"\bbtc\b", q):
-        coin_id = "bitcoin"
-        sym = "BTC"
-    elif "ethereum" in q or re.search(r"\beth\b", q):
-        coin_id = "ethereum"
-        sym = "ETH"
-    else:
-        return None, "crypto: coin not detected"
-
-    # target price
-    m = re.search(r"\$?\s*([0-9]{2,3}(?:[,][0-9]{3})+|[0-9]{4,6})", question.replace("USD", "$"))
-    if not m:
-        return None, "crypto: target not detected"
-    target = float(m.group(1).replace(",", ""))
-
-    # cache history briefly
-    cache = state.setdefault("cache", {}).setdefault("crypto", {})
-    ck = f"cg:{coin_id}"
-    cached = cache.get(ck)
-    if cached and (ts - float(cached.get("ts", 0)) < 600):  # 10 min
-        spot = float(cached["spot"])
-        vol = float(cached["vol"])
-    else:
-        prices = coingecko_price_history(coin_id, 30)
-        if len(prices) < 10:
-            return None, "crypto: not enough history"
-        spot = float(prices[-1])
-        # realized daily log-return std
-        rets = []
-        # sample every ~24h: use rough downsample
-        step = max(1, len(prices) // 30)
-        sampled = prices[::step]
-        for i in range(1, len(sampled)):
-            r = math.log(sampled[i] / sampled[i - 1])
-            rets.append(r)
-        if len(rets) < 5:
-            return None, "crypto: vol calc failed"
-        vol = float(_std(rets))  # daily vol in log terms
-        cache[ck] = {"ts": ts, "spot": spot, "vol": vol}
-
-    # time horizon rough: if question contains a date, assume 7 days else 21 days
-    horizon_days = 21
-    if re.search(r"\bfeb\b|\bmar\b|\bapr\b|\bjan\b|\b2026\b", q):
-        horizon_days = 10  # keep conservative short horizon by default
-
-    # probability BTC >= target at horizon using lognormal approx:
-    # P(S_T >= K) where ln(S_T) ~ N(ln(S0), vol*sqrt(T))
-    T = max(1.0, float(horizon_days))
-    sigma = max(0.0001, vol * math.sqrt(T))
-    mu = math.log(spot)
-
-    z = (math.log(target) - mu) / sigma
-    p = 1.0 - _norm_cdf(z)
-
-    # clamp
-    p = float(max(0.05, min(0.95, p)))
-    return p, f"crypto: {sym} spot≈{spot:.0f}, target={target:.0f}, vol(daily)≈{vol:.3f}, horizon≈{horizon_days}d"
-
-
-def _std(xs: List[float]) -> float:
-    m = sum(xs) / len(xs)
-    v = sum((x - m) ** 2 for x in xs) / max(1, (len(xs) - 1))
-    return math.sqrt(v)
-
-
-def _norm_cdf(x: float) -> float:
-    # Abramowitz/Stegun approx using erf
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-
-# ----------------------------
-# EDGE + RECOMMENDATION
-# ----------------------------
-def compute_edge(market_p_yes: float, ext_p_yes: float) -> float:
-    # in probability points (0-100)
-    return (ext_p_yes - market_p_yes) * 100.0
-
-
-def action_text(edge_pp: float) -> str:
-    # edge_pp positive -> YES undervalued (buy YES)
-    # edge_pp negative -> NO undervalued (buy NO)
-    if edge_pp >= 0:
-        return "✅ ACTION: consider entry now → leaning YES"
-    return "✅ ACTION: consider entry now → leaning NO"
-
-
-def build_reason(cat: str, market_p: float, ext_p: float, edge_pp: float, why: str, liq: float) -> str:
-    return (
-        f"🧠 Reason: Cat={cat} | MarketP(YES)={market_p:.3f} | ExtP(YES)={ext_p:.3f} | "
-        f"Edge={edge_pp:+.1f}pp | Liq={int(liq)} | {why}"
-    )
-
-
-# ----------------------------
-# MAIN LOOP
-# ----------------------------
-def main() -> None:
-    state = load_state()
-    tg_send("🤖 Bot ligado: ACTION-only + Edge (news/weather/crypto).")
-
-    while True:
-        ts = time.time()
-        try:
-            markets = fetch_markets(limit=220)
-        except Exception as e:
-            print("fetch error:", e)
-            time.sleep(SCAN_SECONDS)
+        # basic filters to avoid noise
+        if safe_float(m.get("liquidity")) < MIN_LIQUIDITY:
             continue
 
-        candidates: List[Dict[str, Any]] = []
+        # allow first snapshot (no delta) to still pass if liquidity/volume large
+        vol_delta = safe_float(deltas.get("vol_delta"))
+        pm = abs(safe_float(deltas.get("price_move_pct")))
+        if vol_delta < MIN_VOL_DELTA and pm < MIN_PRICE_MOVE_PCT and safe_float(m.get("volume")) < 100000:
+            continue
 
-        for m in markets:
-            try:
-                if float(m.get("liq", 0)) < MIN_LIQ:
-                    continue
+        if sc < MIN_SCORE:
+            continue
 
-                p_yes = pick_binary_yes_price(m.get("outcomes", []))
-                if p_yes is None:
-                    # skip non-binary for now (you can extend later)
-                    continue
+        m2 = dict(m)
+        m2["_deltas"] = deltas
+        m2["_score"] = sc
+        scored.append((sc, m2, deltas))
 
-                cat = classify_market(m)
-                q = m["question"]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [m for sc, m, _d in scored[:CANDIDATES_TOP_N]]
 
-                ext_p = None
-                why = ""
+# =========================
+# INTEL (lightweight)
+# =========================
+def gdelt_pulse(query: str, hours: int = 24) -> Dict[str, Any]:
+    """
+    Very light “news pulse” using GDELT 2.1 DOC API.
+    We measure article count in last window vs prior window (same size) as a spike indicator.
+    """
+    if not USE_GDELT or not query:
+        return {"ok": False}
 
-                if cat == "weather":
-                    ext_p, why = weather_probability_heuristic(q, m.get("outcomes", []), state, ts)
-                elif cat == "crypto":
-                    ext_p, why = crypto_probability_heuristic(q, state, ts)
-                elif cat in ("politics", "general_news"):
-                    ext_p, why = news_probability_heuristic(q, state, ts)
+    # Windows:
+    # recent: now-hours -> now
+    # prior:  now-2*hours -> now-hours
+    def fmt(t: dt.datetime) -> str:
+        return t.strftime("%Y%m%d%H%M%S")
 
-                if ext_p is None:
-                    continue
+    now = dt.datetime.utcnow()
+    recent_start = now - dt.timedelta(hours=hours)
+    prior_start = now - dt.timedelta(hours=2 * hours)
+    prior_end = recent_start
 
-                edge_pp = compute_edge(p_yes, ext_p)
+    base = "https://api.gdeltproject.org/api/v2/doc/doc"
+    common = {
+        "query": query,
+        "mode": "ArtList",
+        "format": "json",
+        "maxrecords": 75,
+        "sort": "HybridRel"
+    }
 
-                # Only act on meaningful divergence
-                if abs(edge_pp) < EDGE_MIN_PCT:
-                    # decay confirm counter if any
-                    state.setdefault("confirm", {})
-                    if m["id"] in state["confirm"]:
-                        state["confirm"][m["id"]] = max(0, int(state["confirm"][m["id"]]) - 1)
-                    continue
+    try:
+        recent = http_get(base, params={**common, "startdatetime": fmt(recent_start), "enddatetime": fmt(now)})
+        prior = http_get(base, params={**common, "startdatetime": fmt(prior_start), "enddatetime": fmt(prior_end)})
 
-                # confirmation: require consecutive hits
-                state.setdefault("confirm", {})
-                state["confirm"][m["id"]] = int(state["confirm"].get(m["id"], 0)) + 1
-                if int(state["confirm"][m["id"]]) < CONFIRM_SCANS:
-                    continue
+        rc = safe_int(recent.get("totalArticles"), 0) if isinstance(recent, dict) else 0
+        pc = safe_int(prior.get("totalArticles"), 0) if isinstance(prior, dict) else 0
 
-                candidates.append(
-                    {
-                        "id": m["id"],
-                        "url": m.get("url", ""),
-                        "question": m["question"],
-                        "cat": cat,
-                        "liq": float(m.get("liq", 0)),
-                        "p_yes": float(p_yes),
-                        "ext_p": float(ext_p),
-                        "edge_pp": float(edge_pp),
-                        "why": why,
-                    }
-                )
-            except Exception:
-                continue
+        # take a few sources/urls for context
+        sample = []
+        if isinstance(recent, dict):
+            arts = recent.get("articles") or []
+            for a in arts[:5]:
+                title = (a.get("title") or "").strip()
+                url = (a.get("url") or "").strip()
+                if title and url:
+                    sample.append({"title": title, "url": url})
 
-        # prioritize biggest absolute edge, then liquidity
-        candidates.sort(key=lambda x: (abs(x["edge_pp"]), x["liq"]), reverse=True)
+        spike = 0.0
+        if pc > 0:
+            spike = (rc - pc) / pc
+        elif rc > 0:
+            spike = 1.0
 
-        sent = 0
-        for c in candidates:
-            if sent >= MAX_ALERTS_PER_CYCLE:
-                break
-            if not global_hourly_cap_ok(state, ts):
-                break
-            if not cooldown_ok(state, c["id"], ts):
-                continue
+        return {"ok": True, "recent_count": rc, "prior_count": pc, "spike": spike, "sample": sample}
+    except Exception:
+        return {"ok": False}
 
-            msg = (
-                "🚨 ACTION ⬇️\n"
-                f"🎯 {action_text(c['edge_pp'])}\n"
-                f"{build_reason(c['cat'], c['p_yes'], c['ext_p'], c['edge_pp'], c['why'], c['liq'])}\n"
-                f"📌 {clean_title(c['question'])}\n"
-                f"{c['url']}"
+def keywords_from_market(m: Dict[str, Any]) -> str:
+    """
+    Simple keyword extraction for GDELT query.
+    Keeps it conservative to avoid nonsense queries.
+    """
+    q = (m.get("question") or "").lower()
+    slug = (m.get("slug") or "").replace("-", " ")
+    text = f"{q} {slug}"
+
+    # If it's clearly crypto
+    if "bitcoin" in text or "btc" in text:
+        return "bitcoin OR btc"
+    if "ethereum" in text or "eth" in text:
+        return "ethereum OR eth"
+    if "trump" in text:
+        return "trump"
+    if "fed" in text or "fomc" in text or "interest rate" in text:
+        return "federal reserve OR fomc OR interest rates"
+    if "iran" in text:
+        return "iran"
+    if "ukraine" in text:
+        return "ukraine"
+    if "election" in text:
+        return "election"
+
+    # fallback: use a few words from slug
+    words = [w for w in slug.split() if len(w) >= 4][:4]
+    if words:
+        return " ".join(words)
+    return ""
+
+# =========================
+# DECISION (heuristic, LLM-ready)
+# =========================
+def estimate_probability(m: Dict[str, Any], intel: Dict[str, Any]) -> Tuple[float, float, List[str]]:
+    """
+    Returns (p_model, confidence, reasons[])
+    We do *not* claim “true probability”; it's a systematic estimate:
+    - start from market price
+    - adjust slightly based on momentum + volume + news pulse spike
+    """
+    reasons: List[str] = []
+    p_market = safe_float(m.get("yes_price"))
+    p_market = clamp(p_market, 0.01, 0.99)
+
+    deltas = m.get("_deltas") or {}
+    vol_delta = safe_float(deltas.get("vol_delta"))
+    pm = safe_float(deltas.get("price_move_pct"))
+
+    # Base confidence from liquidity + activity
+    liq = safe_float(m.get("liquidity"))
+    conf = 0.45
+    conf += clamp((math.log10(liq + 1) - 3.5) / 3.0, 0.0, 0.25)  # up to +0.25
+    conf += clamp((math.log10(max(vol_delta, 0) + 1) - 3.0) / 4.0, 0.0, 0.18)  # up to +0.18
+
+    # Momentum: if YES price is moving up quickly, market re-pricing; we *discount* edge claims
+    # (more re-pricing => harder to say it's wrong)
+    conf -= clamp(abs(pm) / 12.0, 0.0, 0.10)
+
+    # Intel: if news spike is strong, we trust directional shift more
+    p = p_market
+    if intel.get("ok"):
+        spike = safe_float(intel.get("spike"))
+        rc = safe_int(intel.get("recent_count"), 0)
+        pc = safe_int(intel.get("prior_count"), 0)
+
+        if rc >= 10 and spike >= 0.3:
+            conf += 0.08
+            reasons.append(f"News pulse increased (last {GDELT_WINDOW_H}h: {rc} vs previous: {pc}).")
+        elif rc >= 10:
+            conf += 0.04
+            reasons.append(f"Steady news flow (last {GDELT_WINDOW_H}h: {rc}).")
+
+        # A spike tends to push probability away from 50% in the direction of momentum.
+        # We'll nudge p in the direction of recent price change (pm sign).
+        nudge = clamp(spike, -0.5, 1.5) * 0.02  # max ~3pp
+        if pm > 0:
+            p += nudge
+            if nudge > 0:
+                reasons.append("Price moving up + rising attention (possible repricing to YES).")
+        elif pm < 0:
+            p -= nudge
+            if nudge > 0:
+                reasons.append("Price moving down + rising attention (possible repricing to NO).")
+
+        # Include a couple intel links in reasons (short)
+        sample = intel.get("sample") or []
+        for a in sample[:2]:
+            title = (a.get("title") or "").strip()
+            url = (a.get("url") or "").strip()
+            if title and url:
+                reasons.append(f"Source: {title} — {url}")
+
+    # If no intel, use activity-based micro-adjustment (very small)
+    p += clamp(pm / 100.0, -0.02, 0.02) * 0.5  # ±1pp
+    if abs(pm) >= MIN_PRICE_MOVE_PCT:
+        reasons.append(f"Price move snapshot: {pm:+.2f}% (YES).")
+    if vol_delta >= MIN_VOL_DELTA:
+        reasons.append(f"Volume delta: +{vol_delta:,.0f} (since last check).")
+
+    p = clamp(p, 0.01, 0.99)
+    conf = clamp(conf, 0.35, 0.90)
+    if not reasons:
+        reasons = ["Low-signal market right now (limited evidence)."]
+    return p, conf, reasons
+
+def decide(m: Dict[str, Any], p_model: float, conf: float) -> Optional[Dict[str, Any]]:
+    p_market = clamp(safe_float(m.get("yes_price")), 0.01, 0.99)
+    edge_pp = (p_model - p_market) * 100.0
+
+    if conf < CONF_MIN:
+        return None
+
+    # absolute edge requirement
+    if abs(edge_pp) < EDGE_MIN_PP:
+        return None
+
+    # choose side
+    side = "YES" if edge_pp > 0 else "NO"
+
+    # extra safety: avoid very tiny liquidity
+    if safe_float(m.get("liquidity")) < MIN_LIQUIDITY:
+        return None
+
+    return {"side": side, "edge_pp": edge_pp, "p_market": p_market, "p_model": p_model, "conf": conf}
+
+def human_side(m: Dict[str, Any], side: str) -> str:
+    """
+    Make message clearer than YES/NO for certain market types.
+    """
+    q = (m.get("question") or "").lower()
+    slug = (m.get("slug") or "").lower()
+
+    text = f"{side}"
+    if "bitcoin" in q or "btc" in q or "bitcoin" in slug or "btc" in slug:
+        # If question says "reach", "above", "over": YES means "go above/reach"
+        if "above" in q or "over" in q or "reach" in q or "at least" in q:
+            text = "APOSTAR EM SUBIR/ACIMA (YES)" if side == "YES" else "APOSTAR EM NÃO SUBIR/NÃO CHEGAR (NO)"
+        elif "below" in q or "under" in q:
+            text = "APOSTAR EM FICAR ABAIXO (YES)" if side == "YES" else "APOSTAR EM NÃO FICAR ABAIXO (NO)"
+    return text
+
+# =========================
+# PAPER TRADING
+# =========================
+def paper_pnl(side: str, entry_price: float, exit_price: float, stake_usd: float) -> float:
+    """
+    Rough PnL for binary token pricing:
+    - Assume you buy YES at entry_price with stake.
+      Profit if resolves YES: stake*(1/entry - 1)? but we don't resolve here.
+    For paper-tracking, we approximate mark-to-market using price move on same side.
+    """
+    entry_price = clamp(entry_price, 0.01, 0.99)
+    exit_price = clamp(exit_price, 0.01, 0.99)
+
+    # approximate number of shares = stake / entry_price for YES buys
+    # For NO side, approximate using (1 - price) as "NO price"
+    if side == "YES":
+        shares = stake_usd / entry_price
+        mtm = shares * exit_price - stake_usd
+        return mtm
+    else:
+        entry_no = 1.0 - entry_price
+        exit_no = 1.0 - exit_price
+        entry_no = clamp(entry_no, 0.01, 0.99)
+        exit_no = clamp(exit_no, 0.01, 0.99)
+        shares = stake_usd / entry_no
+        mtm = shares * exit_no - stake_usd
+        return mtm
+
+def maybe_close_old_paper_trades(markets_by_id: Dict[str, Dict[str, Any]]) -> List[str]:
+    msgs: List[str] = []
+    open_trades = db_open_paper_trades()
+    if not open_trades:
+        return msgs
+
+    for t in open_trades:
+        created_at = safe_int(t["created_at"])
+        age_h = (ts() - created_at) / 3600.0
+        if age_h < PAPER_EXIT_HOURS:
+            continue
+
+        mid = t["market_id"]
+        m = markets_by_id.get(mid)
+        if not m:
+            continue
+
+        entry_price = safe_float(t["entry_price"])
+        exit_price = safe_float(m.get("yes_price"))
+        side = t["side"]
+        stake = safe_float(t["stake_usd"])
+        pnl = paper_pnl(side, entry_price, exit_price, stake)
+
+        db_close_paper_trade(int(t["id"]), exit_price, pnl)
+        msgs.append(
+            f"🧾 PAPER EXIT\n"
+            f"- {m.get('question','')[:90]}\n"
+            f"- Side: {side}\n"
+            f"- Entry: {entry_price:.3f} | Exit: {exit_price:.3f}\n"
+            f"- PnL ≈ {pnl:+.2f} USD (stake {stake:.0f})\n"
+            f"- {m.get('url')}"
+        )
+    return msgs
+
+# =========================
+# ALERT FORMATTING
+# =========================
+def should_alert(m: Dict[str, Any], decision_obj: Dict[str, Any]) -> bool:
+    recent = db_recent_alert(m["id"])
+    if not recent:
+        return True
+
+    old_edge = safe_float(recent["edge_pp"])
+    new_edge = safe_float(decision_obj["edge_pp"])
+
+    # Re-alert only if edge improved meaningfully
+    if abs(new_edge) >= abs(old_edge) + REALERT_EDGE_BUMP_PP:
+        return True
+
+    return False
+
+def format_alert(m: Dict[str, Any], dec: Dict[str, Any], reasons: List[str]) -> str:
+    score = safe_float(m.get("_score"))
+    deltas = m.get("_deltas") or {}
+    vol_delta = safe_float(deltas.get("vol_delta"))
+    pm = safe_float(deltas.get("price_move_pct"))
+
+    side = dec["side"]
+    edge_pp = dec["edge_pp"]
+    p_market = dec["p_market"] * 100.0
+    p_model = dec["p_model"] * 100.0
+    conf = dec["conf"]
+
+    action_line = "✅ ACTION: consider entry now" if abs(edge_pp) >= (EDGE_MIN_PP + 2.0) else "👀 ACTION: watch 2–5 min"
+    side_h = human_side(m, side)
+
+    # Keep reasons short
+    rs = reasons[:5]
+    rs_txt = "\n".join([f"• {r}" for r in rs])
+
+    return (
+        f"🚨 EDGE ALERT\n"
+        f"{action_line}\n"
+        f"\n"
+        f"🎯 Recommendation: {side_h}\n"
+        f"🧮 Edge: {edge_pp:+.1f}pp | Market≈{p_market:.1f}% vs Model≈{p_model:.1f}% | Conf={conf:.2f}\n"
+        f"📊 Score={score:.2f} | VolΔ={vol_delta:,.0f} | PriceMove={pm:+.2f}% | Liq={safe_float(m.get('liquidity')):,.0f}\n"
+        f"\n"
+        f"🧠 Why:\n{rs_txt}\n"
+        f"\n"
+        f"🔗 {m.get('url')}"
+    )
+
+# =========================
+# MAIN RUNNERS
+# =========================
+def run_scanner() -> None:
+    db_init()
+
+    markets = fetch_markets(limit=MAX_MARKETS_FETCH, active_only=ACTIVE_ONLY)
+    if not markets:
+        tg_send("⚠️ Bot: No markets returned from Gamma API. Check GAMMA_BASE or connectivity.")
+        return
+
+    # Update snapshots in DB (so deltas exist next run)
+    for m in markets:
+        db_insert_snapshot(m)
+
+    markets_by_id = {m["id"]: m for m in markets}
+
+    # Close old paper trades if applicable (use latest prices)
+    exit_msgs = maybe_close_old_paper_trades(markets_by_id)
+    for msg in exit_msgs[:6]:  # avoid spam
+        tg_send(msg)
+
+    candidates = pick_candidates(markets)
+
+    if not candidates:
+        tg_send("🤖 Scanner: no high-signal opportunities right now (filters passed none).")
+        return
+
+    sent = 0
+    for m in candidates:
+        # Intel only after shortlist
+        intel_query = keywords_from_market(m)
+        intel = gdelt_pulse(intel_query, hours=GDELT_WINDOW_H) if intel_query else {"ok": False}
+
+        p_model, conf, reasons = estimate_probability(m, intel)
+        dec = decide(m, p_model, conf)
+        if not dec:
+            continue
+
+        # anti-spam
+        if not should_alert(m, dec):
+            continue
+
+        alert = format_alert(m, dec, reasons)
+        tg_send(alert)
+        db_insert_alert(m["id"], m.get("slug", ""), float(dec["edge_pp"]), float(m.get("_score", 0.0)))
+        sent += 1
+
+        # paper trade (default)
+        if DRY_RUN == "1":
+            db_create_paper_trade(
+                market_id=m["id"],
+                slug=m.get("slug", ""),
+                side=dec["side"],
+                entry_price=safe_float(m.get("yes_price")),
+                stake_usd=PAPER_STAKE_USD,
+                meta={
+                    "score": m.get("_score"),
+                    "edge_pp": dec["edge_pp"],
+                    "p_market": dec["p_market"],
+                    "p_model": dec["p_model"],
+                    "conf": dec["conf"],
+                    "reasons": reasons[:8],
+                    "url": m.get("url")
+                }
             )
-            tg_send(msg)
-            mark_alert(state, c["id"], ts)
-            sent += 1
 
-        save_state(state)
-        time.sleep(SCAN_SECONDS)
+        if sent >= 4:
+            # Keep it tight to avoid spam
+            break
 
+    if sent == 0:
+        tg_send("🤖 Scanner: candidates found, but none passed edge/conf thresholds (or cooldown active).")
+
+def run_midday() -> None:
+    db_init()
+    stats = db_paper_stats(days=7)
+    open_trades = db_open_paper_trades()
+
+    msg = (
+        "🕛 MIDDAY CHECK\n"
+        f"- Open paper trades: {len(open_trades)}\n"
+        f"- Closed (7d): {stats['n']}\n"
+        f"- Winrate: {stats['winrate']*100:.1f}% | ROI: {stats['roi']*100:.1f}%\n"
+        f"- PnL: {stats['pnl']:+.2f} USD | MaxDD: {stats['max_dd']:.2f}\n"
+    )
+    tg_send(msg)
+
+def run_report() -> None:
+    db_init()
+    stats = db_paper_stats(days=7)
+
+    # last 24h alerts summary
+    cutoff = ts() - 86400
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM alerts_sent
+        WHERE created_at>=?
+        ORDER BY created_at DESC
+        LIMIT 10
+    """, (cutoff,))
+    rows = cur.fetchall()
+    conn.close()
+
+    lines = []
+    for r in rows:
+        lines.append(f"- {r['slug'] or r['market_id']} | edge {safe_float(r['edge_pp']):+.1f}pp | score {safe_float(r['score']):.1f}")
+
+    digest = "\n".join(lines) if lines else "- (no alerts in last 24h)"
+
+    msg = (
+        "📌 DAILY REPORT\n"
+        f"- Paper closed (7d): {stats['n']}\n"
+        f"- Winrate: {stats['winrate']*100:.1f}% | ROI: {stats['roi']*100:.1f}%\n"
+        f"- PnL: {stats['pnl']:+.2f} USD | Avg/trade: {stats['avg_pnl']:+.2f} | MaxDD: {stats['max_dd']:.2f}\n"
+        "\n"
+        "🔔 Last 24h alerts:\n"
+        f"{digest}"
+    )
+    tg_send(msg)
+
+def run_night() -> None:
+    # Same as scanner for now (different cron time)
+    run_scanner()
+
+def main() -> None:
+    try:
+        if MODE == "SCANNER":
+            run_scanner()
+        elif MODE == "MIDDAY":
+            run_midday()
+        elif MODE == "REPORT":
+            run_report()
+        elif MODE == "NIGHT":
+            run_night()
+        else:
+            tg_send(f"⚠️ Unknown MODE={MODE}. Use SCANNER|MIDDAY|REPORT|NIGHT.")
+    except Exception as e:
+        err = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-3500:]
+        tg_send("❌ Bot crashed:\n" + err)
+        raise
 
 if __name__ == "__main__":
+    # Allow overriding mode via CLI: python main.py REPORT
+    if len(sys.argv) >= 2:
+        MODE = sys.argv[1].strip().upper()
     main()
