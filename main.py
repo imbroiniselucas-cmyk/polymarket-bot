@@ -4,44 +4,48 @@
 import os
 import time
 import json
-import math
-import traceback
 import requests
-from typing import Dict, Any, Optional
+import re
 
-# =========================================================
-# POLYMARKET AGENT-STYLE SIGNAL BOT (NO AUTO TRADING)
-# - Market anomalies (price + volume)
-# - News / context analysis
-# - Human-readable reasoning
-# - Telegram alerts only
-# =========================================================
+# ======================================================
+# POLYMARKET INFORMATION-GAP BOT (LEVEL 1)
+# - Detects info gaps vs external sources
+# - Weather (forecast vs odds)
+# - News-driven (crypto / politics / macro)
+# - Telegram alerts ONLY
+# ======================================================
 
-GAMMA_BASE = "https://gamma-api.polymarket.com"
+GAMMA_API = "https://gamma-api.polymarket.com"
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "90"))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "180"))  # 3 min
 STATE_FILE = "state.json"
 
-MIN_LIQUIDITY = 10000
-MIN_VOLUME = 12000
-MIN_PRICE_MOVE = 0.015
-MIN_PCT_MOVE = 4
-MIN_VOLUME_DELTA = 4000
-
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "polymarket-agent-bot/1.0"})
+session = requests.Session()
+session.headers.update({"User-Agent": "pm-info-gap-bot/1.0"})
 
 
-# -------------------------
-# Utilities
-# -------------------------
-def now():
-    return int(time.time())
+# ------------------------------------------------------
+# Telegram
+# ------------------------------------------------------
+def tg(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(msg)
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    session.post(url, json={
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    })
 
 
+# ------------------------------------------------------
+# State
+# ------------------------------------------------------
 def load_state():
     if not os.path.exists(STATE_FILE):
         return {}
@@ -54,155 +58,183 @@ def save_state(s):
         json.dump(s, f, indent=2)
 
 
-def tg(msg):
-    if not TELEGRAM_BOT_TOKEN:
-        print(msg)
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    SESSION.post(url, json={
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    })
-
-
-def http(path, params=None):
-    r = SESSION.get(GAMMA_BASE + path, params=params or {}, timeout=20)
+# ------------------------------------------------------
+# Polymarket helpers
+# ------------------------------------------------------
+def fetch_markets():
+    r = session.get(GAMMA_API + "/markets", params={"limit": 200}, timeout=20)
     r.raise_for_status()
     return r.json()
 
 
-# -------------------------
-# News Context (Agent Brain)
-# -------------------------
-def fetch_news_context(query: str) -> str:
-    """
-    Lightweight news context via Google News RSS.
-    No API key needed.
-    """
-    try:
-        url = "https://news.google.com/rss/search"
-        params = {"q": query, "hl": "en", "gl": "US"}
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code != 200:
-            return "No recent headlines found."
-
-        # ultra-simple parsing
-        headlines = []
-        for line in r.text.split("<title>")[2:6]:
-            headline = line.split("</title>")[0]
-            headlines.append("• " + headline)
-
-        return "\n".join(headlines) if headlines else "No relevant news."
-    except Exception:
-        return "News lookup failed."
-
-
-# -------------------------
-# Market Logic
-# -------------------------
 def extract_yes_price(m):
-    for k in ("outcomes", "tokens"):
-        arr = m.get(k)
+    for key in ("outcomes", "tokens"):
+        arr = m.get(key)
         if isinstance(arr, list):
             for o in arr:
                 if (o.get("name") or "").lower() == "yes":
                     try:
                         return float(o.get("price"))
-                    except Exception:
-                        pass
+                    except:
+                        return None
     return None
 
 
-def analyze_market(m, prev):
-    price = extract_yes_price(m)
-    if price is None:
+# ------------------------------------------------------
+# WEATHER INTELLIGENCE
+# ------------------------------------------------------
+def detect_weather_market(question: str):
+    """
+    Very simple NLP:
+    Looks for temperature + city + date
+    """
+    q = question.lower()
+
+    if "temperature" not in q and "temp" not in q:
         return None
 
-    volume = float(m.get("volume", 0))
-    liquidity = float(m.get("liquidity", 0))
+    city_match = re.search(r"in ([a-zA-Z ]+)", q)
+    temp_match = re.search(r"(\d+)\s?°?\s?c", q)
 
-    if liquidity < MIN_LIQUIDITY or volume < MIN_VOLUME:
+    if not city_match or not temp_match:
         return None
 
-    prev_price = prev.get("price", price)
-    prev_volume = prev.get("volume", volume)
-
-    d_price = price - prev_price
-    d_pct = (d_price / prev_price * 100) if prev_price else 0
-    d_vol = volume - prev_volume
-
-    if abs(d_price) < MIN_PRICE_MOVE:
-        return None
-    if abs(d_pct) < MIN_PCT_MOVE:
-        return None
-    if d_vol < MIN_VOLUME_DELTA:
-        return None
-
-    confidence = "LOW"
-    if abs(d_pct) > 8 and d_vol > 12000:
-        confidence = "HIGH"
-    elif abs(d_pct) > 5:
-        confidence = "MEDIUM"
-
-    title = m.get("question", "Polymarket Market")
-    news = fetch_news_context(title[:80])
+    city = city_match.group(1).strip()
+    threshold = int(temp_match.group(1))
 
     return {
-        "title": title,
-        "price": price,
-        "d_price": d_price,
-        "d_pct": d_pct,
-        "d_vol": d_vol,
-        "confidence": confidence,
-        "url": f"https://polymarket.com/market/{m.get('slug','')}",
-        "news": news
+        "city": city,
+        "threshold": threshold
     }
 
 
-# -------------------------
-# Main Loop
-# -------------------------
+def fetch_weather_forecast(city: str):
+    """
+    Uses Open-Meteo (no API key)
+    """
+    try:
+        geo = session.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": city, "count": 1},
+            timeout=10
+        ).json()
+
+        if not geo.get("results"):
+            return None
+
+        lat = geo["results"][0]["latitude"]
+        lon = geo["results"][0]["longitude"]
+
+        weather = session.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "daily": "temperature_2m_max",
+                "timezone": "UTC"
+            },
+            timeout=10
+        ).json()
+
+        temps = weather.get("daily", {}).get("temperature_2m_max", [])
+        if not temps:
+            return None
+
+        return max(temps[:1])  # next day max
+    except:
+        return None
+
+
+# ------------------------------------------------------
+# NEWS INTELLIGENCE (crypto / politics / macro)
+# ------------------------------------------------------
+def fetch_news_headlines(query: str):
+    """
+    Google News RSS (no API key)
+    """
+    try:
+        r = session.get(
+            "https://news.google.com/rss/search",
+            params={"q": query, "hl": "en", "gl": "US"},
+            timeout=10
+        )
+        headlines = []
+        for part in r.text.split("<title>")[2:5]:
+            headlines.append(part.split("</title>")[0])
+        return headlines
+    except:
+        return []
+
+
+# ------------------------------------------------------
+# MAIN LOOP
+# ------------------------------------------------------
 def main():
     state = load_state()
-    tg("🤖 Agent-style Polymarket bot online.\nWatching information flows, not just prices.")
+    tg("🧠 Polymarket INFO-GAP bot online.\nScanning markets vs real-world information.")
 
     while True:
         try:
-            markets = http("/markets", {"limit": 200})
+            markets = fetch_markets()
+
             for m in markets:
-                mid = str(m.get("id"))
-                prev = state.get(mid, {})
+                market_id = str(m.get("id"))
+                if not market_id or market_id in state:
+                    continue
 
-                signal = analyze_market(m, prev)
-                state[mid] = {
-                    "price": extract_yes_price(m),
-                    "volume": m.get("volume", 0),
-                    "last": now()
-                }
+                question = m.get("question", "")
+                yes_price = extract_yes_price(m)
+                if yes_price is None:
+                    continue
 
-                if signal:
+                implied_prob = yes_price * 100
+                slug = m.get("slug", "")
+                url = f"https://polymarket.com/market/{slug}" if slug else "https://polymarket.com"
+
+                # ---------------- WEATHER GAP ----------------
+                weather = detect_weather_market(question)
+                if weather:
+                    forecast = fetch_weather_forecast(weather["city"])
+                    if forecast and forecast > weather["threshold"] + 0.5:
+                        tg(
+                            f"🌦️ <b>INFORMATION GAP (WEATHER)</b>\n\n"
+                            f"<b>{question}</b>\n\n"
+                            f"Market YES: <b>{implied_prob:.1f}%</b>\n"
+                            f"Forecast max temp: <b>{forecast:.1f}°C</b>\n"
+                            f"Threshold: <b>{weather['threshold']}°C</b>\n\n"
+                            f"Interpretation:\n"
+                            f"• Forecast ABOVE market threshold\n"
+                            f"• Market may be underpricing YES\n\n"
+                            f"Action:\n"
+                            f"• Check resolution rules\n"
+                            f"• Compare with 1–2 other forecasts\n\n"
+                            f"{url}"
+                        )
+                        state[market_id] = True
+                        continue
+
+                # ---------------- NEWS GAP ----------------
+                headlines = fetch_news_headlines(question[:80])
+                if headlines and implied_prob < 50:
                     tg(
-                        f"🧠 <b>AGENT SIGNAL ({signal['confidence']})</b>\n\n"
-                        f"<b>{signal['title']}</b>\n\n"
-                        f"YES price: <b>{signal['price']:.3f}</b>\n"
-                        f"Δ price: <b>{signal['d_price']:+.3f}</b> ({signal['d_pct']:+.1f}%)\n"
-                        f"Δ volume: <b>{int(signal['d_vol'])}</b>\n\n"
-                        f"<b>Context / News</b>\n{signal['news']}\n\n"
-                        f"Interpretation:\n"
-                        f"• Market is repricing based on new information\n"
-                        f"• Volume confirms this is not random\n"
-                        f"• Confidence: <b>{signal['confidence']}</b>\n\n"
-                        f"{signal['url']}"
+                        f"📰 <b>POSSIBLE INFO GAP (NEWS)</b>\n\n"
+                        f"<b>{question}</b>\n\n"
+                        f"Market YES: <b>{implied_prob:.1f}%</b>\n\n"
+                        f"Recent headlines:\n"
+                        + "\n".join([f"• {h}" for h in headlines]) +
+                        f"\n\nInterpretation:\n"
+                        f"• News exists but market may not have repriced yet\n"
+                        f"• Requires human judgment\n\n"
+                        f"{url}"
                     )
+                    state[market_id] = True
 
             save_state(state)
             time.sleep(POLL_SECONDS)
 
         except Exception as e:
             tg(f"❌ Bot error:\n{str(e)[:200]}")
-            time.sleep(30)
+            time.sleep(60)
 
 
 if __name__ == "__main__":
