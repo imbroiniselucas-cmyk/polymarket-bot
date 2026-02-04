@@ -3,9 +3,9 @@
 
 """
 POLYMARKET FAST SCANNER — 15 MIN MODE
-- Muito mais agressivo
-- Zero silêncio
-- Instrução clara: APOSTE A FAVOR / CONTRA
+- Nunca fica em silêncio
+- Alertas claros: APOSTE A FAVOR / CONTRA
+- Watchlist sempre que não houver edge
 """
 
 import os, time, math, sqlite3, traceback, requests
@@ -18,7 +18,7 @@ DB_PATH = "bot.db"
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
-# AGRESSIVIDADE (15 min)
+# AGRESSIVIDADE
 MIN_SCORE = 5.8
 EDGE_MIN_PP = 2.2
 CONF_MIN = 0.50
@@ -35,24 +35,36 @@ FETCH_LIMIT = 1000
 TIMEOUT = 10
 
 # ================= UTILS =================
-def ts(): return int(time.time())
-def clamp(x,a,b): return max(a,min(b,x))
+def ts(): 
+    return int(time.time())
+
+def clamp(x,a,b): 
+    return max(a,min(b,x))
+
 def f(x,d=0): 
-    try: return float(x)
-    except: return d
+    try: 
+        return float(x)
+    except: 
+        return d
 
 # ================= TELEGRAM =================
 def send(msg):
-    if not TELEGRAM_BOT_TOKEN:
-        print(msg); return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(msg)
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg,
-            "disable_web_page_preview": True
-        }, timeout=TIMEOUT)
-    except: pass
+        requests.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg,
+                "disable_web_page_preview": True
+            },
+            timeout=TIMEOUT
+        )
+    except:
+        pass
 
 # ================= DB =================
 def db():
@@ -73,7 +85,8 @@ def init_db():
 def last_snap(mid):
     c=db();cur=c.cursor()
     cur.execute("SELECT * FROM snap WHERE id=? ORDER BY t DESC LIMIT 1",(mid,))
-    r=cur.fetchone();c.close();return r
+    r=cur.fetchone();c.close()
+    return r
 
 def save_snap(mid,yes,vol):
     c=db();cur=c.cursor()
@@ -86,7 +99,8 @@ def recent_alert(mid):
         "SELECT * FROM alert WHERE id=? AND t>?",
         (mid,ts()-ALERT_COOLDOWN_MIN*60)
     )
-    r=cur.fetchone();c.close();return r
+    r=cur.fetchone();c.close()
+    return r
 
 def save_alert(mid,edge):
     c=db();cur=c.cursor()
@@ -117,13 +131,20 @@ def instruction(q,side):
 # ================= MAIN =================
 def main():
     init_db()
-    markets = fetch_markets()
+    send("✅ Scanner 15m rodou agora. Analisando mercados…")
+
+    try:
+        markets = fetch_markets()
+    except Exception:
+        send("❌ Erro ao buscar mercados do Polymarket.")
+        return
+
     sent = 0
     watch = []
 
     for m in markets:
         mid = str(m.get("id"))
-        q = m.get("question","")
+        q = m.get("question","(sem pergunta)")
         yes = f(m.get("outcomePrices",[0])[0])
         vol = f(m.get("volume",0))
         liq = f(m.get("liquidity",0))
@@ -131,50 +152,59 @@ def main():
         last = last_snap(mid)
         save_snap(mid,yes,vol)
 
-        if not last: continue
-        vol_delta = vol - f(last["vol"])
-        pm = ((yes - f(last["yes"])) / f(last["yes"],1)) * 100
+        if not last:
+            continue
 
-        if liq < MIN_LIQ and vol < 50000: continue
+        vol_delta = vol - f(last["vol"])
+        pm = ((yes - f(last["yes"])) / max(f(last["yes"]),0.01)) * 100
+
+        if liq < MIN_LIQ and vol < 50000:
+            continue
 
         sc = score(liq,vol_delta,pm)
-        if sc < MIN_SCORE: continue
+        if sc < MIN_SCORE:
+            continue
 
         p_model = clamp(yes + pm/100*0.4,0.01,0.99)
         edge = (p_model - yes) * 100
         conf = clamp(sc/10,0,1)
 
-        if conf < CONF_MIN: continue
-
         watch.append((q,yes,vol_delta,pm))
 
-        if abs(edge) < EDGE_MIN_PP: continue
+        if conf < CONF_MIN or abs(edge) < EDGE_MIN_PP:
+            continue
 
         r = recent_alert(mid)
         if r and abs(edge) < abs(f(r["edge"])) + REALERT_EDGE_BUMP:
             continue
 
         side = "YES" if edge > 0 else "NO"
+
         send(
-            "🚨 EDGE ALERT\n"
+            "🚨 EDGE DETECTADO\n"
             f"{instruction(q,side)}\n"
             f"🎯 ENTRAR AGORA\n"
             f"🧠 Mercado ~{yes*100:.1f}% vs Modelo ~{p_model*100:.1f}%\n"
-            f"📊 Edge {edge:+.2f}pp | VolΔ {vol_delta:.0f} | Move {pm:+.2f}%\n"
+            f"📊 Edge {edge:+.2f}pp | ΔVol {vol_delta:.0f} | Move {pm:+.2f}%\n"
             f"https://polymarket.com/market/{m.get('slug','')}"
         )
         save_alert(mid,edge)
         sent += 1
-        if sent >= MAX_ALERTS: break
+        if sent >= MAX_ALERTS:
+            break
 
-    if sent == 0 and watch:
-        msg = "⏳ MERCADOS EM MOVIMENTO (15min)\n"
-        for w in watch[:5]:
-            msg += f"- {w[0][:50]} | YES {w[1]:.3f} | ΔV {w[2]:.0f} | Δ% {w[3]:+.2f}\n"
-        send(msg)
+    if sent == 0:
+        if watch:
+            msg = "⏳ MERCADOS EM MOVIMENTO (15min)\n"
+            for w in watch[:5]:
+                msg += f"- {w[0][:55]} | YES {w[1]:.3f} | ΔV {w[2]:.0f} | Δ% {w[3]:+.2f}\n"
+            send(msg)
+        else:
+            send("👀 Primeira execução ou mercado parado. Próximo ciclo deve gerar sinais.")
 
+# ================= RUN =================
 if __name__ == "__main__":
     try:
         main()
     except Exception:
-        send("❌ Bot crashou\n"+traceback.format_exc()[-2000:])
+        send("❌ Bot crashou:\n"+traceback.format_exc()[-2000:])
