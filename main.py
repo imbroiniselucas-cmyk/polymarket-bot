@@ -1,15 +1,24 @@
-import os, time
+import os
+import time
+import telebot
 
-def show(k):
-    v = os.getenv(k)
-    if v is None:
-        print(k, "=", "None")
-    else:
-        print(k, "LEN=", len(v), "START=", repr(v[:6]))
+TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
+CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
-show("TELEGRAM_TOKEN")
-show("TELEGRAM_CHAT_ID")
+print("TOKEN_LEN:", len(TOKEN))
+print("CHAT_ID:", repr(CHAT_ID))
 
-# fica vivo pra você ver o log
-while True:
-    time.sleep(60)
+if not TOKEN or not CHAT_ID:
+    print("MISSING_VARS")
+    while True:
+        time.sleep(60)
+
+bot = telebot.TeleBot(TOKEN)
+
+try:
+    bot.send_message(CHAT_ID, "✅ TESTE: Railway -> Telegram OK (mensagem de teste).")
+    print("SENT_OK")
+except Exception as e:
+    print("SEND_FAILED:", repr(e))
+
+time.sleep(60)
