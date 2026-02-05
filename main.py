@@ -5,22 +5,37 @@ import os
 import time
 import re
 import hashlib
+import threading
 from datetime import datetime, timezone
 from urllib.parse import quote_plus
 from xml.etree import ElementTree as ET
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 import telebot
 
-# =========================================================
-# 0) BOOT (prova de que o código novo subiu)
-# =========================================================
-BOOT_TAG = "BOOT_OK_v1.0"
-print(f"=== {BOOT_TAG} | main.py loaded ===")
+# ========= 0) HTTP server mínimo pro Railway (WEB) =========
+def start_health_server():
+    port = int(os.getenv("PORT", "8080"))
 
-# =========================================================
-# 1) ENV (NUNCA CRASHA se faltar vars)
-# =========================================================
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, format, *args):
+            # silenciar logs HTTP
+            return
+
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    print(f"[health] listening on 0.0.0.0:{port}", flush=True)
+    server.serve_forever()
+
+threading.Thread(target=start_health_server, daemon=True).start()
+
+# ========= 1) ENV =========
 def env_get(key: str) -> str:
     v = os.getenv(key)
     return "" if v is None else v.strip()
@@ -28,21 +43,20 @@ def env_get(key: str) -> str:
 TELEGRAM_TOKEN = env_get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = env_get("TELEGRAM_CHAT_ID")
 
+print("BOOT_OK: main.py running", flush=True)
+
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    print("⚠️ Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID.")
-    print("ENV has TELEGRAM_TOKEN?", "TELEGRAM_TOKEN" in os.environ, "LEN:", len(TELEGRAM_TOKEN))
-    print("ENV has TELEGRAM_CHAT_ID?", "TELEGRAM_CHAT_ID" in os.environ, "VAL:", repr(TELEGRAM_CHAT_ID))
-    print("TELE/CHAT keys visible:", [k for k in os.environ.keys() if "TELE" in k or "CHAT" in k])
-    print("👉 Fix: Railway -> Service -> Variables (Production/Preview) + Redeploy.")
-    # fica vivo para você ver logs (não crasha em loop)
+    print("⚠️ Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID.", flush=True)
+    print("ENV has TELEGRAM_TOKEN?", "TELEGRAM_TOKEN" in os.environ, "LEN:", len(TELEGRAM_TOKEN), flush=True)
+    print("ENV has TELEGRAM_CHAT_ID?", "TELEGRAM_CHAT_ID" in os.environ, "VAL:", repr(TELEGRAM_CHAT_ID), flush=True)
+    print("TELE/CHAT keys:", [k for k in os.environ.keys() if "TELE" in k or "CHAT" in k], flush=True)
+    # não crasha: fica vivo
     while True:
         time.sleep(60)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode=None)
 
-# =========================================================
-# 2) SETTINGS (tune via Railway Variables)
-# =========================================================
+# ========= 2) SETTINGS =========
 def env_int(key: str, default: int) -> int:
     try:
         return int(env_get(key) or default)
@@ -56,16 +70,15 @@ def env_float(key: str, default: float) -> float:
         return default
 
 POLL_SECONDS        = env_int("POLL_SECONDS", 60)
-ALERT_EVERY_SECONDS = env_int("ALERT_EVERY_SECONDS", 600)   # 10 min por mercado
-HEARTBEAT_SECONDS   = env_int("HEARTBEAT_SECONDS", 600)     # 10 min status
+ALERT_EVERY_SECONDS = env_int("ALERT_EVERY_SECONDS", 600)   # 10 min
+HEARTBEAT_SECONDS   = env_int("HEARTBEAT_SECONDS", 600)     # 10 min
 
 MARKET_LIMIT        = env_int("MARKET_LIMIT", 140)
-
 MIN_LIQUIDITY       = env_float("MIN_LIQUIDITY", 15000.0)
 MIN_VOLUME          = env_float("MIN_VOLUME", 15000.0)
-MIN_SPREAD          = env_float("MIN_SPREAD", 0.015)        # 1.5¢
-MIN_MOVE_ABS        = env_float("MIN_MOVE_ABS", 0.010)      # 1.0¢
-MOVE_LOOKBACK_SEC   = env_int("MOVE_LOOKBACK_SEC", 900)     # 15 min
+MIN_SPREAD          = env_float("MIN_SPREAD", 0.015)
+MIN_MOVE_ABS        = env_float("MIN_MOVE_ABS", 0.010)
+MOVE_LOOKBACK_SEC   = env_int("MOVE_LOOKBACK_SEC", 900)
 
 NEWS_ENABLED        = (env_get("NEWS_ENABLED") or "1") == "1"
 NEWS_MAX_ITEMS      = env_int("NEWS_MAX_ITEMS", 3)
@@ -75,24 +88,17 @@ NEWS_QUERY_WORDS    = env_int("NEWS_QUERY_WORDS", 5)
 HTTP_TIMEOUT        = env_int("HTTP_TIMEOUT", 15)
 MAX_RETRIES         = env_int("MAX_RETRIES", 3)
 
-# =========================================================
-# 3) ENDPOINTS
-# =========================================================
+# ========= 3) ENDPOINTS =========
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE  = "https://clob.polymarket.com"
 
-# =========================================================
-# 4) STATE
-# =========================================================
-last_alert_at = {}     # market_id -> ts
+# ========= 4) STATE =========
+last_alert_at = {}
 last_heartbeat = 0
+price_hist = {}
+news_seen = {}
 
-price_hist = {}        # token_id -> [(ts, mid)]
-news_seen = {}         # market_id -> set(hash)
-
-# =========================================================
-# 5) HELPERS
-# =========================================================
+# ========= 5) HELPERS =========
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
 
@@ -119,11 +125,11 @@ def sha1(s: str) -> str:
 def send(msg: str):
     bot.send_message(TELEGRAM_CHAT_ID, msg, disable_web_page_preview=True)
 
-def http_get_json(url, params=None, headers=None):
+def http_get_json(url, params=None):
     err = None
     for i in range(1, MAX_RETRIES + 1):
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
+            r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -131,11 +137,11 @@ def http_get_json(url, params=None, headers=None):
             time.sleep(0.6 * i)
     raise err
 
-def http_get_text(url, params=None, headers=None):
+def http_get_text(url, params=None):
     err = None
     for i in range(1, MAX_RETRIES + 1):
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
+            r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
             r.raise_for_status()
             return r.text
         except Exception as e:
@@ -143,22 +149,13 @@ def http_get_text(url, params=None, headers=None):
             time.sleep(0.6 * i)
     raise err
 
-# =========================================================
-# 6) POLYMARKET DATA
-# =========================================================
+# ========= 6) POLYMARKET =========
 def get_markets():
-    params = {
-        "active": "true",
-        "closed": "false",
-        "limit": str(MARKET_LIMIT),
-        "offset": "0",
-    }
+    params = {"active": "true", "closed": "false", "limit": str(MARKET_LIMIT), "offset": "0"}
     return http_get_json(f"{GAMMA_BASE}/markets", params=params)
 
 def get_best_prices(token_id: str):
-    # sell -> best bid ; buy -> best ask
-    bid = None
-    ask = None
+    bid = ask = None
     try:
         j = http_get_json(f"{CLOB_BASE}/price", params={"token_id": token_id, "side": "sell"})
         bid = safe_float(j.get("price"), None)
@@ -174,15 +171,14 @@ def get_best_prices(token_id: str):
 def record_mid(token_id: str, ts: float, mid: float):
     arr = price_hist.get(token_id, [])
     arr.append((ts, mid))
-    cutoff = ts - 7200  # 2h
-    arr = [(t, m) for (t, m) in arr if t >= cutoff]
-    price_hist[token_id] = arr
+    cutoff = ts - 7200
+    price_hist[token_id] = [(t, m) for (t, m) in arr if t >= cutoff]
 
-def move_over_lookback(token_id: str, ts: float, lookback_sec: int):
+def move_over_lookback(token_id: str, ts: float, lookback: int):
     arr = price_hist.get(token_id, [])
     if len(arr) < 2:
         return None
-    target = ts - lookback_sec
+    target = ts - lookback
     past = None
     for (t, m) in arr:
         if t <= target:
@@ -191,19 +187,11 @@ def move_over_lookback(token_id: str, ts: float, lookback_sec: int):
         past = arr[0][1]
     return arr[-1][1] - past
 
-# =========================================================
-# 7) NEWS (Google News RSS)
-# =========================================================
+# ========= 7) NEWS (RSS) =========
 def clean_keywords(question: str):
     q = (question or "").lower()
     q = re.sub(r"[^a-z0-9\s\-\$]", " ", q)
-    words = [w for w in q.split() if len(w) >= 4 and w not in {
-        "will", "price", "reach", "above", "below", "before", "after", "today",
-        "tomorrow", "yesterday", "between", "within", "through", "until",
-        "february", "january", "march", "april", "may", "june", "july", "august",
-        "september", "october", "november", "december", "2024", "2025", "2026",
-        "polymarket"
-    }]
+    words = [w for w in q.split() if len(w) >= 4]
     out, seen = [], set()
     for w in words:
         if w not in seen:
@@ -217,52 +205,41 @@ def fetch_news_rss(query: str):
     root = ET.fromstring(xml)
     items = []
     for item in root.findall(".//item"):
-        title = item.findtext("title") or ""
-        link = item.findtext("link") or ""
-        pub  = item.findtext("pubDate") or ""
-        items.append({"title": title, "link": link, "pubDate": pub})
+        items.append({
+            "title": item.findtext("title") or "",
+            "link": item.findtext("link") or "",
+        })
     return items
 
 def maybe_send_news(market_id: str, question: str):
     if not NEWS_ENABLED:
         return
-
     now = time.time()
     cd_key = f"news::{market_id}"
-    last = last_alert_at.get(cd_key, 0)
-    if now - last < NEWS_COOLDOWN_SEC:
+    if now - last_alert_at.get(cd_key, 0) < NEWS_COOLDOWN_SEC:
         return
-
     kws = clean_keywords(question)
     if not kws:
         return
-
     query = " ".join(kws)
     try:
         items = fetch_news_rss(query)
     except Exception:
         return
-
-    if not items:
-        return
-
     seen = news_seen.get(market_id, set())
     new_items = []
     for it in items[:12]:
-        h = sha1((it["title"] or "") + (it["link"] or ""))
+        h = sha1(it["title"] + it["link"])
         if h not in seen:
             seen.add(h)
             new_items.append(it)
         if len(new_items) >= NEWS_MAX_ITEMS:
             break
-
     if not new_items:
         news_seen[market_id] = seen
         return
-
     news_seen[market_id] = seen
     last_alert_at[cd_key] = now
-
     lines = [f"🗞️ NEWS: {clip(question, 90)}", f"Query: {query}"]
     for it in new_items:
         lines.append(f"• {clip(it['title'], 110)}")
@@ -270,13 +247,10 @@ def maybe_send_news(market_id: str, question: str):
             lines.append(f"  {it['link']}")
     send("\n".join(lines))
 
-# =========================================================
-# 8) ALERT LOGIC
-# =========================================================
-def should_alert(market_id: str) -> bool:
+# ========= 8) ALERTS =========
+def should_alert(market_id: str):
     now = time.time()
-    last = last_alert_at.get(market_id, 0)
-    if now - last >= ALERT_EVERY_SECONDS:
+    if now - last_alert_at.get(market_id, 0) >= ALERT_EVERY_SECONDS:
         last_alert_at[market_id] = now
         return True
     return False
@@ -286,43 +260,28 @@ def heartbeat(scanned: int, candidates: int):
     now = time.time()
     if now - last_heartbeat >= HEARTBEAT_SECONDS:
         last_heartbeat = now
-        send(f"✅ Bot vivo ({now_iso()}) | scanned={scanned} | candidates={candidates} | poll={POLL_SECONDS}s")
-
-def score_candidate(spread: float, move_abs: float, liq: float, vol: float) -> float:
-    score = 0.0
-    if spread >= MIN_SPREAD:
-        score += min(3.0, spread / MIN_SPREAD)
-    if move_abs >= MIN_MOVE_ABS:
-        score += min(3.0, move_abs / MIN_MOVE_ABS)
-    score += min(2.0, liq / (MIN_LIQUIDITY * 4.0))
-    score += min(2.0, vol / (MIN_VOLUME * 4.0))
-    return score
+        send(f"✅ Bot vivo ({now_iso()}) | scanned={scanned} | candidates={candidates}")
 
 def scan_once():
     markets = get_markets()
     ts = time.time()
     scanned = 0
-    candidates = []
+    cands = []
 
     for m in markets:
         scanned += 1
-
         market_id = str(m.get("id") or "")
-        question  = (m.get("question") or "").strip()
-        slug      = (m.get("slug") or "").strip()
-
-        liquidity = safe_float(m.get("liquidity"), 0.0) or 0.0
-        volume = safe_float(m.get("volume"), safe_float(m.get("volume24hr"), 0.0)) or 0.0
-
+        question = (m.get("question") or "").strip()
+        slug = (m.get("slug") or "").strip()
+        liq = safe_float(m.get("liquidity"), 0.0) or 0.0
+        vol = safe_float(m.get("volume"), safe_float(m.get("volume24hr"), 0.0)) or 0.0
         clob_ids = m.get("clobTokenIds") or []
         if not market_id or not question or not isinstance(clob_ids, list) or len(clob_ids) < 1:
             continue
-
-        if liquidity < MIN_LIQUIDITY or volume < MIN_VOLUME:
+        if liq < MIN_LIQUIDITY or vol < MIN_VOLUME:
             continue
 
-        token_id = str(clob_ids[0])  # proxy (geralmente YES)
-
+        token_id = str(clob_ids[0])
         bid, ask = get_best_prices(token_id)
         if bid is None or ask is None:
             continue
@@ -332,68 +291,52 @@ def scan_once():
 
         spread = ask - bid
         mv = move_over_lookback(token_id, ts, MOVE_LOOKBACK_SEC)
-        move_abs = abs(mv) if mv is not None else 0.0
+        mv_abs = abs(mv) if mv is not None else 0.0
 
-        s = score_candidate(spread, move_abs, liquidity, volume)
-        if s < 3.0:
+        score = 0.0
+        if spread >= MIN_SPREAD:
+            score += min(3.0, spread / MIN_SPREAD)
+        if mv_abs >= MIN_MOVE_ABS:
+            score += min(3.0, mv_abs / MIN_MOVE_ABS)
+        score += min(2.0, liq / (MIN_LIQUIDITY * 4.0))
+        score += min(2.0, vol / (MIN_VOLUME * 4.0))
+
+        if score < 3.0:
             continue
 
         url = f"https://polymarket.com/market/{slug}" if slug else "https://polymarket.com/"
-        candidates.append({
-            "market_id": market_id,
-            "question": question,
-            "bid": bid,
-            "ask": ask,
-            "spread": spread,
-            "move": mv,
-            "liq": liquidity,
-            "vol": volume,
-            "score": s,
-            "url": url,
-        })
+        cands.append((score, spread, mv, bid, ask, liq, vol, question, url, market_id))
 
-    candidates.sort(key=lambda x: (x["score"], x["spread"]), reverse=True)
-    heartbeat(scanned, len(candidates))
+    cands.sort(reverse=True, key=lambda x: (x[0], x[1]))
+    heartbeat(scanned, len(cands))
 
-    # alertar top 6 por ciclo (agressivo mas com cooldown por mercado)
-    for c in candidates[:6]:
-        if not should_alert(c["market_id"]):
+    for (score, spread, mv, bid, ask, liq, vol, question, url, market_id) in cands[:6]:
+        if not should_alert(market_id):
             continue
 
         direction = ""
-        if c["move"] is not None:
-            if c["move"] > 0:
-                direction = "📈 momentum: subindo"
-            elif c["move"] < 0:
-                direction = "📉 momentum: caindo"
-            else:
-                direction = "⏸️ momentum: estável"
+        if mv is not None:
+            direction = "📈 subindo" if mv > 0 else ("📉 caindo" if mv < 0 else "⏸️ estável")
 
-        msg = (
+        send(
             "🚨 OPORTUNIDADE\n"
-            f"🧠 {clip(c['question'], 140)}\n"
-            f"Score: {c['score']:.2f} | Liq: {c['liq']:.0f} | Vol: {c['vol']:.0f}\n"
-            f"Bid(sell): {c['bid']:.3f} | Ask(buy): {c['ask']:.3f} | Spread: {c['spread']:.3f}\n"
-            f"{direction}\n"
-            f"🔗 {c['url']}\n\n"
-            "Dica: spread alto costuma dar edge com LIMIT (evitar market)."
+            f"🧠 {clip(question, 140)}\n"
+            f"Score: {score:.2f} | Liq: {liq:.0f} | Vol: {vol:.0f}\n"
+            f"Bid: {bid:.3f} | Ask: {ask:.3f} | Spread: {spread:.3f}\n"
+            f"Momentum: {direction}\n"
+            f"🔗 {url}\n\n"
+            "Dica: se spread está alto, use LIMIT e olhe orderbook."
         )
-        send(msg)
 
-        # news relacionadas (cooldown separado)
-        maybe_send_news(c["market_id"], c["question"])
+        maybe_send_news(market_id, question)
 
-# =========================================================
-# 9) MAIN LOOP
-# =========================================================
 def run():
-    send(f"🤖 Bot online ({now_iso()}) | agressivo-controlado | alert≈10min/market | news={'ON' if NEWS_ENABLED else 'OFF'} | tag={BOOT_TAG}")
+    send(f"🤖 Bot online ({now_iso()}) | heartbeat 10min | alert 10min/market | news={'ON' if NEWS_ENABLED else 'OFF'}")
     while True:
         try:
             scan_once()
         except Exception as e:
-            # não derruba
-            send(f"⚠️ Erro (sigo rodando): {type(e).__name__}: {str(e)[:200]}")
+            send(f"⚠️ Erro (sigo rodando): {type(e).__name__}: {str(e)[:180]}")
         time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
