@@ -2,24 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-Polymarket Alert Bot (AGGRESSIVE_EDGE)
+Polymarket Alert Bot (AGGRESSIVE_EDGE v2)
 - More alerts (lower thresholds)
-- 3-tier alerts: STRONG / TACTICAL / WEAK
+- Recommendation ALWAYS explicit: ENTER YES / ENTER NO / WAIT
+- Explains spread clearly (bid/ask gap)
 - Re-alerts every ~10-15 min OR sooner if big change
-- No annoying health/status spam
+- No health/status spam
 
 ENV REQUIRED:
   TELEGRAM_TOKEN
   TELEGRAM_CHAT_ID
 
 OPTIONAL ENV:
-  POLY_ENDPOINT            # If you have your own JSON endpoint (list of markets)
-  SCAN_EVERY_SEC=180       # default 180s (3 minutes)
-  MAX_MARKETS=300          # default 300
-  COOLDOWN_SEC=900         # default 900 (15 min)
-  REARM_MOVE_PCT=1.2       # price move % to bypass cooldown
-  GAP_MIN=0.008            # 0.8% spread threshold
-  SCORE_MIN=6.5
+  POLY_ENDPOINT
+  SCAN_EVERY_SEC=180
+  MAX_MARKETS=300
+  COOLDOWN_SEC=900
+  REARM_MOVE_PCT=1.2
+  GAP_MIN=0.008
+  SCORE_MIN=6.2
   VOL_MIN=10000
   LIQ_MIN=5000
 """
@@ -27,7 +28,6 @@ OPTIONAL ENV:
 import os
 import time
 import math
-import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,7 +39,6 @@ import requests
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Try telebot first (PyTelegramBotAPI). If not available, fallback to raw HTTP.
 try:
     import telebot  # type: ignore
     _HAS_TELEBOT = True
@@ -60,33 +59,28 @@ def send_telegram(msg: str) -> None:
         bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode=None)
         bot.send_message(TELEGRAM_CHAT_ID, msg, disable_web_page_preview=True)
     else:
-        # Raw Telegram API fallback
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg,
-            "disable_web_page_preview": True,
-        }
+        payload = {"chat_id": TELELEGRAM_CHAT_ID, "text": msg, "disable_web_page_preview": True}
         requests.post(url, json=payload, timeout=15).raise_for_status()
 
 
 # ----------------------------
-# Config (Aggressive defaults)
+# Config
 # ----------------------------
 POLY_ENDPOINT = os.getenv("POLY_ENDPOINT", "").strip()
 
-SCAN_EVERY_SEC = int(os.getenv("SCAN_EVERY_SEC", "180"))          # 3 min
-MAX_MARKETS = int(os.getenv("MAX_MARKETS", "300"))               # how many to scan
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "900"))             # 15 min cooldown
-REARM_MOVE_PCT = float(os.getenv("REARM_MOVE_PCT", "1.2"))       # bypass cooldown if move > 1.2%
+SCAN_EVERY_SEC = int(os.getenv("SCAN_EVERY_SEC", "180"))
+MAX_MARKETS = int(os.getenv("MAX_MARKETS", "300"))
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "900"))
+REARM_MOVE_PCT = float(os.getenv("REARM_MOVE_PCT", "1.2"))
 
-GAP_MIN = float(os.getenv("GAP_MIN", "0.008"))                   # 0.8%
-SCORE_MIN = float(os.getenv("SCORE_MIN", "6.5"))
+GAP_MIN = float(os.getenv("GAP_MIN", "0.008"))       # 0.8%
+SCORE_MIN = float(os.getenv("SCORE_MIN", "6.2"))
 VOL_MIN = float(os.getenv("VOL_MIN", "10000"))
 LIQ_MIN = float(os.getenv("LIQ_MIN", "5000"))
 
 HTTP_TIMEOUT = 20
-UA = {"User-Agent": "AGGRESSIVE_EDGE_BOT/1.0"}
+UA = {"User-Agent": "AGGRESSIVE_EDGE_BOT/2.0"}
 
 
 # ----------------------------
@@ -118,17 +112,40 @@ def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 
+def _title(m: Dict[str, Any]) -> str:
+    for k in ["title", "question", "name", "marketTitle"]:
+        if k in m and m.get(k):
+            return _clean(str(m.get(k)))
+    ev = m.get("event") or {}
+    if isinstance(ev, dict) and ev.get("title"):
+        return _clean(str(ev.get("title")))
+    return "Untitled market"
+
+
+def _url(m: Dict[str, Any]) -> str:
+    for k in ["url", "marketUrl", "market_url", "link"]:
+        if k in m and m.get(k):
+            return str(m.get(k)).strip()
+    slug = m.get("slug")
+    if slug:
+        return f"https://polymarket.com/market/{slug}"
+    mid = m.get("id") or m.get("marketId") or m.get("market_id")
+    if mid:
+        return f"https://polymarket.com/event/{mid}"
+    return "https://polymarket.com/markets"
+
+
+def _market_key(m: Dict[str, Any]) -> str:
+    for k in ["id", "marketId", "market_id", "conditionId", "condition_id", "slug"]:
+        if k in m and m.get(k):
+            return str(m.get(k))
+    return _title(m)[:80]
+
+
 def _best_yes_price(m: Dict[str, Any]) -> Optional[float]:
-    """
-    Try hard to find a 'YES' price in many common Polymarket/Gamma schemas.
-    Returns a float in [0,1] or None.
-    """
-    # Common Gamma: outcomePrices might be list ["0.43","0.57"] + outcomes ["Yes","No"]
     outcomes = m.get("outcomes")
     outcome_prices = m.get("outcomePrices") or m.get("outcome_prices")
-
     if outcomes and outcome_prices and isinstance(outcomes, list) and isinstance(outcome_prices, list):
-        # Find index of "Yes"
         idx = None
         for i, o in enumerate(outcomes):
             if str(o).strip().lower() == "yes":
@@ -138,38 +155,17 @@ def _best_yes_price(m: Dict[str, Any]) -> Optional[float]:
             p = _to_float(outcome_prices[idx], default=-1.0)
             if 0.0 <= p <= 1.0:
                 return p
-
-    # Sometimes "prices" dict
-    for key in ["yesPrice", "yes_price", "p_yes", "probability_yes", "probYes", "price_yes"]:
+    for key in ["yesPrice", "yes_price", "p_yes", "probYes", "lastTradePrice", "last_trade_price", "last", "lastPrice"]:
         if key in m:
             p = _to_float(m.get(key), default=-1.0)
             if 0.0 <= p <= 1.0:
                 return p
-
-    # Sometimes orderbook fields
-    for key in ["bestAsk", "best_ask", "ask", "yesAsk", "yes_ask"]:
-        if key in m:
-            p = _to_float(m.get(key), default=-1.0)
-            if 0.0 <= p <= 1.0:
-                return p
-
-    # If only "lastTradePrice"
-    for key in ["lastTradePrice", "last_trade_price", "last", "lastPrice"]:
-        if key in m:
-            p = _to_float(m.get(key), default=-1.0)
-            if 0.0 <= p <= 1.0:
-                return p
-
     return None
 
 
-def _spread(m: Dict[str, Any]) -> float:
-    """
-    Estimate spread as ask - bid if available; else 0.
-    """
+def _best_bid_ask(m: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     bid_keys = ["bestBid", "best_bid", "bid", "yesBid", "yes_bid"]
     ask_keys = ["bestAsk", "best_ask", "ask", "yesAsk", "yes_ask"]
-
     bid = None
     ask = None
     for k in bid_keys:
@@ -184,6 +180,11 @@ def _spread(m: Dict[str, Any]) -> float:
             if 0.0 <= v <= 1.0:
                 ask = v
                 break
+    return bid, ask
+
+
+def _spread(m: Dict[str, Any]) -> float:
+    bid, ask = _best_bid_ask(m)
     if bid is None or ask is None:
         return 0.0
     return max(0.0, ask - bid)
@@ -195,7 +196,6 @@ def _volume(m: Dict[str, Any]) -> float:
             v = _to_float(m.get(k), default=0.0)
             if v > 0:
                 return v
-    # Sometimes nested
     v = m.get("volume")
     if isinstance(v, dict):
         for kk in ["usd", "USD", "24h", "24hr"]:
@@ -215,97 +215,64 @@ def _liquidity(m: Dict[str, Any]) -> float:
     return 0.0
 
 
-def _title(m: Dict[str, Any]) -> str:
-    for k in ["title", "question", "name", "marketTitle"]:
-        if k in m and m.get(k):
-            return _clean(str(m.get(k)))
-    # Sometimes event title + market title
-    ev = m.get("event") or {}
-    if isinstance(ev, dict) and ev.get("title"):
-        return _clean(str(ev.get("title")))
-    return "Untitled market"
-
-
-def _url(m: Dict[str, Any]) -> str:
-    # If already provided
-    for k in ["url", "marketUrl", "market_url", "link"]:
-        if k in m and m.get(k):
-            return str(m.get(k)).strip()
-
-    # Gamma sometimes provides "slug"
-    slug = m.get("slug")
-    if slug:
-        return f"https://polymarket.com/market/{slug}"
-
-    # Sometimes "id" that maps to /event/<id> (not always correct, but better than nothing)
-    mid = m.get("id") or m.get("marketId") or m.get("market_id")
-    if mid:
-        return f"https://polymarket.com/event/{mid}"
-
-    return "https://polymarket.com/markets"
-
-
-def _market_key(m: Dict[str, Any]) -> str:
-    # stable key for cooldown cache
-    for k in ["id", "marketId", "market_id", "conditionId", "condition_id", "slug"]:
-        if k in m and m.get(k):
-            return str(m.get(k))
-    return _title(m)[:80]
-
-
-def _recommendation_from_move(price_now: float, price_prev: Optional[float]) -> Tuple[str, str]:
-    """
-    Simple momentum recommendation:
-      if price rising -> lean YES
-      if falling -> lean NO
-      else -> WATCH
-    """
-    if price_prev is None:
-        return ("WATCH", "no recent baseline yet")
-    delta = price_now - price_prev
-    if abs(delta) < 0.002:
-        return ("WATCH", "flat since last scan")
-    if delta > 0:
-        return ("LEAN YES", f"momentum up (+{delta:.3f})")
-    return ("LEAN NO", f"momentum down ({delta:.3f})")
-
-
 def _score(vol: float, liq: float, spread: float, move_abs: float) -> float:
-    """
-    Aggressive heuristic score (higher = more actionable)
-    - rewards spread (inefficiency) + movement + liquidity/volume
-    """
-    # normalize
-    vol_term = math.log10(max(vol, 1.0))          # ~ 4 to 7 typical
-    liq_term = math.log10(max(liq, 1.0))          # ~ 3 to 7 typical
-
-    spread_term = (spread * 100.0) * 0.85         # spread in cents, weighted
-    move_term = (move_abs * 100.0) * 0.60         # move in cents, weighted
-
-    # base + small bonus for "healthy" markets
-    base = 1.5
+    vol_term = math.log10(max(vol, 1.0))
+    liq_term = math.log10(max(liq, 1.0))
+    spread_term = (spread * 100.0) * 0.9
+    move_term = (move_abs * 100.0) * 0.7
+    base = 1.2
     s = base + vol_term + liq_term + spread_term + move_term
     return float(_clamp(s, 0.0, 20.0))
 
 
 def _tier(score: float, spread: float, move_abs: float) -> str:
-    # STRONG: big dislocation or very high score
     if score >= 10.0 or spread >= 0.02 or move_abs >= 0.03:
         return "STRONG"
-    if score >= 7.5:
+    if score >= 7.4:
         return "TACTICAL"
     return "WEAK"
 
 
+def _recommendation_explicit(
+    title: str,
+    yes_price: float,
+    prev_yes: Optional[float],
+    spread: float,
+    liq: float,
+) -> Tuple[str, str]:
+    """
+    Returns (action, why)
+    action: "ENTER YES" | "ENTER NO" | "WAIT"
+    """
+
+    # If we have momentum info
+    if prev_yes is not None:
+        d = yes_price - prev_yes
+        if abs(d) >= 0.006:
+            if d > 0:
+                return ("ENTER YES (A FAVOR)", f"momentum up (+{d:.3f})")
+            else:
+                return ("ENTER NO (CONTRA)", f"momentum down ({d:.3f})")
+
+    # No strong momentum (or no baseline): use price-location logic
+    # YES very cheap (<0.35): favor buying YES; YES very expensive (>0.65): favor buying NO
+    if yes_price <= 0.35:
+        return ("ENTER YES (A FAVOR)", "YES is cheap (asymmetric upside if it rebounds)")
+    if yes_price >= 0.65:
+        return ("ENTER NO (CONTRA)", "YES is expensive (better value on NO side)")
+
+    # Mid-zone: only enter if market is tradable
+    if spread <= 0.012 and liq >= 10000:
+        # In mid-zone, lean with micro-bias by title keywords (optional, simple)
+        # But we keep it neutral to avoid false confidence
+        return ("WAIT / WATCH", "mid-price zone (0.35–0.65): need clearer move or catalyst")
+    return ("WAIT / WATCH", "spread/liquidity not ideal for clean entry")
+
+
 # ----------------------------
-# Polymarket fetch
+# Fetch
 # ----------------------------
 def fetch_markets() -> List[Dict[str, Any]]:
-    """
-    Fetch markets from:
-    1) POLY_ENDPOINT (user-provided JSON)
-    2) Polymarket Gamma API as fallback
-    """
     if POLY_ENDPOINT:
         r = requests.get(POLY_ENDPOINT, headers=UA, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
@@ -316,11 +283,9 @@ def fetch_markets() -> List[Dict[str, Any]]:
             return data
         return []
 
-    # Fallback: Gamma API (public)
-    # Note: schema can vary; we parse defensively.
     url = "https://gamma-api.polymarket.com/markets"
     out: List[Dict[str, Any]] = []
-    limit = min(MAX_MARKETS, 200)  # gamma limit often 200
+    limit = min(MAX_MARKETS, 200)
     offset = 0
 
     while len(out) < MAX_MARKETS:
@@ -341,7 +306,7 @@ def fetch_markets() -> List[Dict[str, Any]]:
         if len(chunk) < limit:
             break
         offset += limit
-        if offset > 1000:  # safety
+        if offset > 1000:
             break
 
     return out[:MAX_MARKETS]
@@ -353,26 +318,22 @@ def fetch_markets() -> List[Dict[str, Any]]:
 def main() -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID.")
-        print("Set them in Railway -> Variables -> Production.")
         return
 
-    # Cooldown + history
     last_sent_ts: Dict[str, float] = {}
-    last_price: Dict[str, float] = {}
+    last_yes: Dict[str, float] = {}
     last_vol: Dict[str, float] = {}
 
-    send_telegram("🤖 Bot ON: AGGRESSIVE_EDGE (more alerts, 3 tiers, 3-min scans).")
+    send_telegram("🤖 Bot ON: AGGRESSIVE_EDGE v2 (explicit ENTER YES/NO, more alerts).")
 
     while True:
         try:
             markets = fetch_markets()
         except Exception as e:
-            # No spam: only one error every 20 min
             now = time.time()
-            key = "FETCH_ERROR"
-            if now - last_sent_ts.get(key, 0) > 1200:
+            if now - last_sent_ts.get("FETCH_ERROR", 0) > 1200:
                 send_telegram(f"⚠️ Fetch error: {type(e).__name__}: {e}")
-                last_sent_ts[key] = now
+                last_sent_ts["FETCH_ERROR"] = now
             time.sleep(SCAN_EVERY_SEC)
             continue
 
@@ -381,63 +342,64 @@ def main() -> None:
 
         for m in markets:
             try:
-                title = _title(m)
                 key = _market_key(m)
+                title = _title(m)
                 url = _url(m)
 
-                p = _best_yes_price(m)
-                if p is None:
+                yes = _best_yes_price(m)
+                if yes is None:
                     continue
-                p = _clamp(p, 0.0, 1.0)
+                yes = _clamp(yes, 0.0, 1.0)
 
-                spread = _spread(m)  # 0..1
+                bid, ask = _best_bid_ask(m)
+                spread = _spread(m)
                 vol = _volume(m)
                 liq = _liquidity(m)
 
-                # Aggressive filters (still minimal sanity)
+                # Minimal sanity filters (aggressive)
                 if vol < VOL_MIN and liq < LIQ_MIN:
                     continue
-                if spread < GAP_MIN:
-                    # still allow if big move (tactical)
-                    pass
 
-                prev_p = last_price.get(key)
-                move_abs = abs(p - prev_p) if prev_p is not None else 0.0
+                prev_yes = last_yes.get(key)
+                move_abs = abs(yes - prev_yes) if prev_yes is not None else 0.0
 
-                # Volume delta (if available)
                 prev_vol = last_vol.get(key, vol)
                 vol_delta = max(0.0, vol - prev_vol)
 
                 score = _score(vol=vol, liq=liq, spread=spread, move_abs=move_abs)
 
-                # Gate by score, but allow if spread good or move big
-                if score < SCORE_MIN and spread < GAP_MIN and move_abs < 0.015:
-                    last_price[key] = p
+                # Gate (still aggressive)
+                if score < SCORE_MIN and spread < GAP_MIN and move_abs < 0.012:
+                    last_yes[key] = yes
                     last_vol[key] = vol
                     continue
 
-                # Cooldown logic (aggressive rearm)
+                # Cooldown + rearm
                 t_last = last_sent_ts.get(key, 0.0)
                 cooldown_ok = (now - t_last) >= COOLDOWN_SEC
-                rearm_ok = prev_p is not None and (abs(p - prev_p) / max(prev_p, 1e-9) * 100.0) >= REARM_MOVE_PCT
+                rearm_ok = prev_yes is not None and (abs(yes - prev_yes) / max(prev_yes, 1e-9) * 100.0) >= REARM_MOVE_PCT
 
                 if not cooldown_ok and not rearm_ok:
-                    last_price[key] = p
+                    last_yes[key] = yes
                     last_vol[key] = vol
                     continue
 
                 tier = _tier(score=score, spread=spread, move_abs=move_abs)
-                rec, rec_reason = _recommendation_from_move(price_now=p, price_prev=prev_p)
+                action, why = _recommendation_explicit(title, yes, prev_yes, spread, liq)
 
-                # Make message very explicit
-                # Show "YES price" and implied "NO price" (approx)
-                no_price = _clamp(1.0 - p, 0.0, 1.0)
+                no = _clamp(1.0 - yes, 0.0, 1.0)
+
+                # Spread explanation in message
+                spread_cents = spread * 100.0
+                bid_s = f"{bid:.3f}" if bid is not None else "n/a"
+                ask_s = f"{ask:.3f}" if ask is not None else "n/a"
 
                 msg = (
-                    f"🚨 {tier} | Edge scan\n"
-                    f"🎯 ACTION: {rec}\n"
-                    f"🧠 Why: {rec_reason} | Spread={_pct(spread)} | Move={_pct(move_abs)}\n"
-                    f"💰 YES={p:.3f} | NO≈{no_price:.3f}\n"
+                    f"🚨 {tier} | ALERT\n"
+                    f"✅ RECOMMENDATION: {action}\n"
+                    f"🧠 Reason: {why}\n"
+                    f"💰 YES={yes:.3f} | NO≈{no:.3f} | Move={_pct(move_abs)}\n"
+                    f"📌 Spread: {spread_cents:.2f}¢ ({_pct(spread)})  [bid={bid_s} / ask={ask_s}]\n"
                     f"📊 Vol={vol:,.0f} (Δ{vol_delta:,.0f}) | Liq={liq:,.0f} | Score={score:.2f}\n"
                     f"📝 {title}\n"
                     f"{url}"
@@ -447,19 +409,14 @@ def main() -> None:
                 last_sent_ts[key] = now
                 alerts_sent += 1
 
-                # Hard cap per scan to avoid floods
-                if alerts_sent >= 12:
+                if alerts_sent >= 14:
                     break
 
-                last_price[key] = p
+                last_yes[key] = yes
                 last_vol[key] = vol
 
             except Exception:
-                # swallow per-market parse errors silently (no spam)
                 continue
-
-        # Update cached prices for markets we didn’t alert on as well
-        # (we already update inside loop when processing)
 
         time.sleep(SCAN_EVERY_SEC)
 
