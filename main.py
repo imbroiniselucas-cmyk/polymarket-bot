@@ -2,14 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-Polymarket Alert Bot (AGGRESSIVE_EDGE v3)
-- MORE alerts (lower thresholds)
-- Recommendation ALWAYS explicit:
-    ✅ ENTER YES (A FAVOR)  or  ✅ ENTER NO (CONTRA)  or  WAIT
-- Weather/Climate edge engine for: London, Buenos Aires, Ankara
-- Shows MONEY FLOW MOVE% (volume delta % since last scan)
-- Shows PRICE MOVE% (YES price move % since last scan)
-- No health/status spam
+Polymarket Alert Bot (AGGRESSIVE_EDGE v4)
+FOCUS:
+  1) Arbitrage (risk-free) when possible: YES_ASK + NO_ASK < 1 - buffer
+  2) High moves: price move % + flow move % (volume delta %)
+  3) News context: pulls latest headlines via GDELT (no API key)
 
 REQUIRED ENV:
   TELEGRAM_TOKEN
@@ -18,20 +15,23 @@ REQUIRED ENV:
 OPTIONAL ENV:
   POLY_ENDPOINT
   SCAN_EVERY_SEC=180
-  MAX_MARKETS=350
+  MAX_MARKETS=400
   COOLDOWN_SEC=600
-  REARM_PRICE_MOVE_PCT=1.0
-  REARM_VOL_MOVE_PCT=8.0
 
-  # General thresholds
-  GAP_MIN=0.006
-  SCORE_MIN=6.0
+  # High-move triggers
+  PRICE_MOVE_ALERT_PCT=4.0      # alert if YES price changes >= 4% since last scan
+  FLOW_MOVE_ALERT_PCT=12.0      # alert if volume changes >= 12% since last scan
+  ABS_PRICE_MOVE_ALERT=0.020    # alert if absolute YES change >= 2.0 cents
+
+  # Arbitrage triggers (risk buffer)
+  ARB_BUFFER=0.004              # require at least 0.4% edge after slippage
+
+  # General filters
   VOL_MIN=8000
   LIQ_MIN=4000
 
-  # Weather edge settings
-  WEATHER_EDGE_MIN=0.08          # minimum edge to enter (8pp)
-  WEATHER_SIGMA_C=1.8            # uncertainty used to turn point forecast into probability (temp)
+  # Weather/Climate focus cities (title match only)
+  (hardcoded: London, Buenos Aires, Ankara)
 """
 
 import os
@@ -40,7 +40,6 @@ import math
 import re
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
 
 import requests
 
@@ -61,8 +60,7 @@ def send_telegram(msg: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID.")
         return
-
-    msg = msg.strip()
+    msg = (msg or "").strip()
     if not msg:
         return
 
@@ -81,29 +79,23 @@ def send_telegram(msg: str) -> None:
 POLY_ENDPOINT = os.getenv("POLY_ENDPOINT", "").strip()
 
 SCAN_EVERY_SEC = int(os.getenv("SCAN_EVERY_SEC", "180"))
-MAX_MARKETS = int(os.getenv("MAX_MARKETS", "350"))
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "600"))  # 10 min
+MAX_MARKETS = int(os.getenv("MAX_MARKETS", "400"))
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "600"))
 
-REARM_PRICE_MOVE_PCT = float(os.getenv("REARM_PRICE_MOVE_PCT", "1.0"))  # bypass cooldown if price moved > 1%
-REARM_VOL_MOVE_PCT = float(os.getenv("REARM_VOL_MOVE_PCT", "8.0"))      # bypass cooldown if volume moved > 8%
+PRICE_MOVE_ALERT_PCT = float(os.getenv("PRICE_MOVE_ALERT_PCT", "4.0")) / 100.0
+FLOW_MOVE_ALERT_PCT = float(os.getenv("FLOW_MOVE_ALERT_PCT", "12.0")) / 100.0
+ABS_PRICE_MOVE_ALERT = float(os.getenv("ABS_PRICE_MOVE_ALERT", "0.020"))
 
-GAP_MIN = float(os.getenv("GAP_MIN", "0.006"))       # 0.6%
-SCORE_MIN = float(os.getenv("SCORE_MIN", "6.0"))
+ARB_BUFFER = float(os.getenv("ARB_BUFFER", "0.004"))
+
 VOL_MIN = float(os.getenv("VOL_MIN", "8000"))
 LIQ_MIN = float(os.getenv("LIQ_MIN", "4000"))
 
-WEATHER_EDGE_MIN = float(os.getenv("WEATHER_EDGE_MIN", "0.08"))
-WEATHER_SIGMA_C = float(os.getenv("WEATHER_SIGMA_C", "1.8"))
-
 HTTP_TIMEOUT = 20
-UA = {"User-Agent": "AGGRESSIVE_EDGE_BOT/3.0"}
+UA = {"User-Agent": "AGGRESSIVE_EDGE_BOT/4.0"}
 
-# Cities (fixed list you asked for)
-CITY_DB = {
-    "london": {"name": "London", "lat": 51.5072, "lon": -0.1276, "tz": "Europe/London"},
-    "buenos aires": {"name": "Buenos Aires", "lat": -34.6037, "lon": -58.3816, "tz": "America/Argentina/Buenos_Aires"},
-    "ankara": {"name": "Ankara", "lat": 39.9334, "lon": 32.8597, "tz": "Europe/Istanbul"},
-}
+# Cities you asked for
+CITY_KEYS = ["london", "buenos aires", "ankara"]
 
 
 # ----------------------------
@@ -162,58 +154,7 @@ def _market_key(m: Dict[str, Any]) -> str:
     for k in ["id", "marketId", "market_id", "conditionId", "condition_id", "slug"]:
         if k in m and m.get(k):
             return str(m.get(k))
-    return _title(m)[:80]
-
-
-def _best_yes_price(m: Dict[str, Any]) -> Optional[float]:
-    outcomes = m.get("outcomes")
-    outcome_prices = m.get("outcomePrices") or m.get("outcome_prices")
-
-    if outcomes and outcome_prices and isinstance(outcomes, list) and isinstance(outcome_prices, list):
-        idx = None
-        for i, o in enumerate(outcomes):
-            if str(o).strip().lower() == "yes":
-                idx = i
-                break
-        if idx is not None and idx < len(outcome_prices):
-            p = _to_float(outcome_prices[idx], default=-1.0)
-            if 0.0 <= p <= 1.0:
-                return p
-
-    for key in ["yesPrice", "yes_price", "p_yes", "probYes", "lastTradePrice", "last_trade_price", "last", "lastPrice"]:
-        if key in m:
-            p = _to_float(m.get(key), default=-1.0)
-            if 0.0 <= p <= 1.0:
-                return p
-
-    return None
-
-
-def _best_bid_ask(m: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    bid_keys = ["bestBid", "best_bid", "bid", "yesBid", "yes_bid"]
-    ask_keys = ["bestAsk", "best_ask", "ask", "yesAsk", "yes_ask"]
-    bid = None
-    ask = None
-    for k in bid_keys:
-        if k in m:
-            v = _to_float(m.get(k), default=-1.0)
-            if 0.0 <= v <= 1.0:
-                bid = v
-                break
-    for k in ask_keys:
-        if k in m:
-            v = _to_float(m.get(k), default=-1.0)
-            if 0.0 <= v <= 1.0:
-                ask = v
-                break
-    return bid, ask
-
-
-def _spread(m: Dict[str, Any]) -> float:
-    bid, ask = _best_bid_ask(m)
-    if bid is None or ask is None:
-        return 0.0
-    return max(0.0, ask - bid)
+    return _title(m)[:90]
 
 
 def _volume(m: Dict[str, Any]) -> float:
@@ -241,263 +182,166 @@ def _liquidity(m: Dict[str, Any]) -> float:
     return 0.0
 
 
-def _score(vol: float, liq: float, spread: float, move_abs: float) -> float:
-    vol_term = math.log10(max(vol, 1.0))
-    liq_term = math.log10(max(liq, 1.0))
-    spread_term = (spread * 100.0) * 0.9
-    move_term = (move_abs * 100.0) * 0.7
-    base = 1.1
-    s = base + vol_term + liq_term + spread_term + move_term
-    return float(_clamp(s, 0.0, 20.0))
-
-
-def _tier(score: float, spread: float, move_abs: float) -> str:
-    if score >= 10.0 or spread >= 0.02 or move_abs >= 0.03:
-        return "STRONG"
-    if score >= 7.2:
-        return "TACTICAL"
-    return "WEAK"
-
-
 # ----------------------------
-# Weather/Climate engine
+# Price / orderbook parsing (defensive)
 # ----------------------------
-def is_weather_market(title: str) -> bool:
-    t = title.lower()
-    city_hit = any(c in t for c in CITY_DB.keys())
-    if not city_hit:
-        return False
-    keys = [
-        "temperature", "temp", "high", "low", "max", "minimum", "maximum",
-        "rain", "precip", "precipitation", "snow", "wind", "°c", "°f",
-        "mm", "cm", "inches", "mph", "km/h"
-    ]
-    return any(k in t for k in keys)
+def _yes_no_from_outcome_prices(m: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    outcomePrices + outcomes sometimes contain mid prices for YES/NO (not bids/asks).
+    Still useful for move alerts & fallback.
+    """
+    outcomes = m.get("outcomes")
+    prices = m.get("outcomePrices") or m.get("outcome_prices")
+    if not (isinstance(outcomes, list) and isinstance(prices, list) and len(outcomes) == len(prices)):
+        return (None, None)
+
+    yes = no = None
+    for i, o in enumerate(outcomes):
+        name = str(o).strip().lower()
+        p = _to_float(prices[i], default=-1.0)
+        if not (0.0 <= p <= 1.0):
+            continue
+        if name == "yes":
+            yes = p
+        elif name == "no":
+            no = p
+    return (yes, no)
 
 
-def _parse_city(title: str) -> Optional[dict]:
-    t = title.lower()
-    for k, v in CITY_DB.items():
-        if k in t:
-            return v
+def _extract_side_prices(m: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """
+    Try many common key patterns for YES/NO bid/ask.
+    Not all markets expose this; if missing, arb may not be computable.
+    """
+    keys = {
+        "yes_bid": ["yesBid", "yes_bid", "bestBidYes", "best_bid_yes", "bid_yes"],
+        "yes_ask": ["yesAsk", "yes_ask", "bestAskYes", "best_ask_yes", "ask_yes"],
+        "no_bid":  ["noBid", "no_bid", "bestBidNo", "best_bid_no", "bid_no"],
+        "no_ask":  ["noAsk", "no_ask", "bestAskNo", "best_ask_no", "ask_no"],
+    }
+    out: Dict[str, Optional[float]] = {k: None for k in keys}
+
+    for out_k, in_keys in keys.items():
+        for kk in in_keys:
+            if kk in m:
+                v = _to_float(m.get(kk), default=-1.0)
+                if 0.0 <= v <= 1.0:
+                    out[out_k] = v
+                    break
+
+    # fallback: some schemas only have bestBid/bestAsk without side; treat as YES
+    if out["yes_bid"] is None and "bestBid" in m:
+        v = _to_float(m.get("bestBid"), default=-1.0)
+        if 0.0 <= v <= 1.0:
+            out["yes_bid"] = v
+    if out["yes_ask"] is None and "bestAsk" in m:
+        v = _to_float(m.get("bestAsk"), default=-1.0)
+        if 0.0 <= v <= 1.0:
+            out["yes_ask"] = v
+
+    return out
+
+
+def _best_yes_price(m: Dict[str, Any]) -> Optional[float]:
+    """
+    Prefer explicit YES mid/last; fallback to outcomePrices.
+    """
+    for key in ["yesPrice", "yes_price", "p_yes", "probYes", "lastTradePrice", "last_trade_price", "last", "lastPrice"]:
+        if key in m:
+            p = _to_float(m.get(key), default=-1.0)
+            if 0.0 <= p <= 1.0:
+                return p
+    yes, _no = _yes_no_from_outcome_prices(m)
+    if yes is not None:
+        return yes
     return None
 
 
-def _parse_date(title: str) -> str:
+# ----------------------------
+# Arbitrage logic
+# ----------------------------
+def find_arbitrage(side: Dict[str, Optional[float]]) -> Optional[Dict[str, Any]]:
     """
-    Best-effort:
-      - "today" => today
-      - "tomorrow" => today+1
-      - otherwise default to tomorrow (common in weather markets)
+    Risk-free arb if you can BUY both sides cheap enough:
+      YES_ASK + NO_ASK < 1 - ARB_BUFFER
     """
-    t = title.lower()
-    today = dt.date.today()
-    if "today" in t:
-        return today.isoformat()
-    if "tomorrow" in t:
-        return (today + dt.timedelta(days=1)).isoformat()
-    # try parse month/day like "Feb 6" / "February 6"
-    m = re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{1,2})\b", t)
-    if m:
-        mon = m.group(1)[:3]
-        day = int(m.group(2))
-        month_map = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-                     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
-        year = today.year
-        month = month_map.get(mon, today.month)
-        try:
-            d = dt.date(year, month, day)
-            # if already passed, assume next year
-            if d < today:
-                d = dt.date(year + 1, month, day)
-            return d.isoformat()
-        except Exception:
-            pass
-    return (today + dt.timedelta(days=1)).isoformat()
-
-
-def _parse_metric_threshold(title: str) -> Tuple[str, float, str]:
-    """
-    metric: tmax/tmin/precip/windmax
-    units: C/F/mm
-    op: >= or <=
-    """
-    t = title.lower()
-
-    # op
-    if any(w in t for w in ["below", "under", "less than", "at most", "no more than"]):
-        op = "<="
-    else:
-        op = ">="
-
-    # metric
-    if any(w in t for w in ["low", "min", "minimum"]):
-        metric = "tmin"
-    elif any(w in t for w in ["high", "max", "maximum"]):
-        metric = "tmax"
-    elif any(w in t for w in ["rain", "precip", "precipitation", "snow"]):
-        metric = "precip"
-    elif "wind" in t:
-        metric = "windmax"
-    else:
-        metric = "tmax"
-
-    # units
-    units = "C"
-    if "°f" in t or "fahrenheit" in t:
-        units = "F"
-    if metric == "precip":
-        # keep mm-ish. If inches appears, we still handle it.
-        if "inch" in t or "inches" in t:
-            units = "IN"
-        else:
-            units = "MM"
-
-    # threshold: first numeric
-    m = re.search(r"(-?\d+(\.\d+)?)", t)
-    if not m:
-        raise ValueError("No numeric threshold found")
-    thr = float(m.group(1))
-
-    return metric, thr, op, units
-
-
-def open_meteo_hourly(lat: float, lon: float, tz: str) -> dict:
-    base = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "temperature_2m,precipitation,windspeed_10m",
-        "timezone": tz,
-    }
-    url = base + "?" + urlencode(params)
-    r = requests.get(url, timeout=HTTP_TIMEOUT, headers=UA)
-    r.raise_for_status()
-    return r.json()
-
-
-def _c_to_f(x: float) -> float:
-    return x * 9.0 / 5.0 + 32.0
-
-
-def _mm_to_in(x: float) -> float:
-    return x / 25.4
-
-
-def compute_daily_metric(data: dict, date_iso: str, metric: str, units: str) -> float:
-    times = data["hourly"]["time"]
-    temp = data["hourly"]["temperature_2m"]
-    precip = data["hourly"]["precipitation"]
-    wind = data["hourly"]["windspeed_10m"]
-
-    vals_temp, vals_precip, vals_wind = [], [], []
-    for i, ts in enumerate(times):
-        if ts.startswith(date_iso):
-            vals_temp.append(float(temp[i]))
-            vals_precip.append(float(precip[i]))
-            vals_wind.append(float(wind[i]))
-
-    if not vals_temp:
-        raise ValueError("No hourly data for date (timezone/date mismatch)")
-
-    if metric == "tmax":
-        v = max(vals_temp)
-        if units == "F":
-            v = _c_to_f(v)
-        return float(v)
-
-    if metric == "tmin":
-        v = min(vals_temp)
-        if units == "F":
-            v = _c_to_f(v)
-        return float(v)
-
-    if metric == "precip":
-        v = sum(vals_precip)  # mm by default
-        if units == "IN":
-            v = _mm_to_in(v)
-        return float(v)
-
-    if metric == "windmax":
-        v = max(vals_wind)  # km/h usually from Open-Meteo; we keep numeric as-is
-        return float(v)
-
-    v = max(vals_temp)
-    if units == "F":
-        v = _c_to_f(v)
-    return float(v)
-
-
-def _norm_cdf(z: float) -> float:
-    # Normal CDF using erf; good enough for trading decisions
-    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
-
-
-def prob_yes_from_point_forecast(point: float, threshold: float, op: str, metric: str, units: str) -> float:
-    """
-    Convert point forecast -> probability using a conservative uncertainty model.
-    This is NOT perfect, but it turns weather into a tradable probability.
-    """
-    # sigma defaults by metric
-    if metric in ["tmax", "tmin"]:
-        sigma = WEATHER_SIGMA_C
-        if units == "F":
-            sigma = WEATHER_SIGMA_C * 9.0 / 5.0
-    elif metric == "precip":
-        sigma = 2.5 if units == "MM" else 0.10  # ~2.5mm or ~0.1 inch
-    elif metric == "windmax":
-        sigma = 4.0  # km/h-ish uncertainty
-    else:
-        sigma = WEATHER_SIGMA_C
-
-    sigma = max(0.2, float(sigma))
-
-    # If op is >= : P = P(X >= thr)
-    if op == ">=":
-        z = (point - threshold) / sigma
-        return float(_clamp(1.0 - _norm_cdf(-z), 0.0, 1.0))  # same as CDF(z)
-    else:
-        z = (threshold - point) / sigma
-        return float(_clamp(1.0 - _norm_cdf(-z), 0.0, 1.0))
-
-
-def recommend_from_prob(p_yes: float, market_yes: float, edge_min: float) -> Tuple[str, str, float]:
-    edge = p_yes - market_yes
-    if edge >= edge_min:
-        return ("ENTER YES (A FAVOR)", f"P(YES)={p_yes:.0%} vs Market={market_yes:.0%} | Edge=+{edge:.0%}", edge)
-    if (-edge) >= edge_min:
-        return ("ENTER NO (CONTRA)", f"P(YES)={p_yes:.0%} vs Market={market_yes:.0%} | Edge={edge:.0%} (YES overpriced)", edge)
-    return ("WAIT / WATCH", f"P(YES)={p_yes:.0%} vs Market={market_yes:.0%} | Edge={edge:.0%} (small)", edge)
-
-
-def weather_edge_decision(title: str, yes_price: float) -> Optional[Dict[str, Any]]:
-    city = _parse_city(title)
-    if not city:
+    ya = side.get("yes_ask")
+    na = side.get("no_ask")
+    if ya is None or na is None:
         return None
 
-    date_iso = _parse_date(title)
-    metric, threshold, op, units = _parse_metric_threshold(title)
+    total = ya + na
+    if total < (1.0 - ARB_BUFFER):
+        profit = (1.0 - total)
+        return {
+            "type": "BUY_BOTH",
+            "yes_ask": ya,
+            "no_ask": na,
+            "sum": total,
+            "locked_profit": profit,
+        }
+    return None
 
-    data = open_meteo_hourly(city["lat"], city["lon"], city["tz"])
-    point = compute_daily_metric(data, date_iso, metric, units)
 
-    p_yes = prob_yes_from_point_forecast(point, threshold, op, metric, units)
-    action, why, edge = recommend_from_prob(p_yes, yes_price, WEATHER_EDGE_MIN)
+# ----------------------------
+# News via GDELT (no key)
+# ----------------------------
+STOPWORDS = {
+    "will", "the", "a", "an", "to", "of", "in", "on", "by", "for", "and", "or", "is", "are", "be",
+    "above", "below", "reach", "hit", "over", "under", "before", "after", "with", "at", "from",
+    "london", "buenos", "aires", "ankara", "today", "tomorrow",
+    "price", "bitcoin", "eth", "btc", "yes", "no"
+}
 
-    # Build a compact explanation
-    metric_label = {"tmax": "Temp MAX", "tmin": "Temp MIN", "precip": "Precip", "windmax": "Wind MAX"}.get(metric, metric)
-    cond = f"{metric_label} {op} {threshold:g}{('°'+units) if units in ['C','F'] else (' '+units)}"
-    return {
-        "city": city["name"],
-        "date": date_iso,
-        "cond": cond,
-        "forecast_point": point,
-        "units": units,
-        "p_yes": p_yes,
-        "edge": edge,
-        "action": action,
-        "why": why,
+def build_query_from_title(title: str) -> str:
+    # extract meaningful tokens; keep uppercase tickers or long words
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}", title)
+    keep: List[str] = []
+    for t in tokens:
+        tl = t.lower()
+        if tl in STOPWORDS:
+            continue
+        if len(t) >= 4:
+            keep.append(t)
+    # Use top 3–4 tokens
+    keep = keep[:4]
+    if not keep:
+        # fallback: city-focused
+        for c in CITY_KEYS:
+            if c in title.lower():
+                return c
+        return title.split("?")[0][:40]
+    return " AND ".join(keep)
+
+
+def fetch_gdelt_headlines(query: str, max_items: int = 3) -> List[str]:
+    """
+    GDELT 2 DOC API - last ~24h of results.
+    """
+    base = "https://api.gdeltproject.org/api/v2/doc/doc"
+    params = {
+        "query": query,
+        "mode": "ArtList",
+        "format": "json",
+        "maxrecords": str(max_items),
+        "timespan": "1d",
+        "sourcelang": "English",
+        "sort": "HybridRel",
     }
+    try:
+        r = requests.get(base, params=params, headers=UA, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        arts = data.get("articles", []) if isinstance(data, dict) else []
+        out = []
+        for a in arts[:max_items]:
+            title = _clean(str(a.get("title", "")))
+            source = _clean(str(a.get("sourceCountry", ""))) or _clean(str(a.get("source", "")))
+            if title:
+                out.append(f"• {title}" + (f" ({source})" if source else ""))
+        return out
+    except Exception:
+        return []
 
 
 # ----------------------------
@@ -537,29 +381,39 @@ def fetch_markets() -> List[Dict[str, Any]]:
         if len(chunk) < limit:
             break
         offset += limit
-        if offset > 1000:
+        if offset > 1200:
             break
 
     return out[:MAX_MARKETS]
 
 
 # ----------------------------
-# General recommendation (non-weather)
+# Alert formatting / decisions
 # ----------------------------
-def recommend_general(yes_now: float, yes_prev: Optional[float]) -> Tuple[str, str]:
+def move_direction_label(yes_now: float, yes_prev: Optional[float]) -> str:
     if yes_prev is None:
-        # Always explicit even without baseline
-        if yes_now <= 0.35:
-            return ("ENTER YES (A FAVOR)", "YES is cheap (value side)")
-        if yes_now >= 0.65:
-            return ("ENTER NO (CONTRA)", "YES is expensive (value on NO)")
-        return ("WAIT / WATCH", "no baseline yet; mid-price zone")
-    d = yes_now - yes_prev
-    if abs(d) < 0.002:
-        return ("WAIT / WATCH", "flat since last scan")
-    if d > 0:
-        return ("ENTER YES (A FAVOR)", f"momentum up (+{d:.3f})")
-    return ("ENTER NO (CONTRA)", f"momentum down ({d:.3f})")
+        return "N/A"
+    if yes_now > yes_prev:
+        return "UP (toward YES)"
+    if yes_now < yes_prev:
+        return "DOWN (toward NO)"
+    return "FLAT"
+
+
+def explicit_trade_side_from_move(yes_now: float, yes_prev: Optional[float]) -> str:
+    # Clear: if price jumped up, momentum is YES; if down, momentum is NO
+    if yes_prev is None:
+        return "WAIT"
+    if yes_now > yes_prev:
+        return "ENTER YES (A FAVOR)"
+    if yes_now < yes_prev:
+        return "ENTER NO (CONTRA)"
+    return "WAIT"
+
+
+def is_focus_city_market(title: str) -> bool:
+    t = title.lower()
+    return any(c in t for c in CITY_KEYS)
 
 
 # ----------------------------
@@ -574,7 +428,7 @@ def main() -> None:
     last_yes: Dict[str, float] = {}
     last_vol: Dict[str, float] = {}
 
-    send_telegram("🤖 Bot ON: AGGRESSIVE_EDGE v3 (London/Buenos Aires/Ankara weather edge + explicit YES/NO + flow move%).")
+    send_telegram("🤖 Bot ON: v4 (ARB + HIGH MOVES + NEWS context).")
 
     while True:
         try:
@@ -588,7 +442,7 @@ def main() -> None:
             continue
 
         now = time.time()
-        alerts_sent = 0
+        sent = 0
 
         for m in markets:
             try:
@@ -596,109 +450,104 @@ def main() -> None:
                 title = _title(m)
                 url = _url(m)
 
+                vol = _volume(m)
+                liq = _liquidity(m)
+
+                if vol < VOL_MIN and liq < LIQ_MIN:
+                    continue
+
                 yes = _best_yes_price(m)
                 if yes is None:
                     continue
                 yes = _clamp(yes, 0.0, 1.0)
 
-                bid, ask = _best_bid_ask(m)
-                spread = _spread(m)
-                vol = _volume(m)
-                liq = _liquidity(m)
-
-                # Aggressive but sane filters
-                if vol < VOL_MIN and liq < LIQ_MIN:
-                    continue
-
                 prev_yes = last_yes.get(key)
                 prev_vol = last_vol.get(key, vol)
 
-                # Price move (%)
-                move_abs = abs(yes - prev_yes) if prev_yes is not None else 0.0
+                # Price moves
+                abs_move = abs(yes - prev_yes) if prev_yes is not None else 0.0
                 price_move_pct = (abs(yes - prev_yes) / max(prev_yes, 1e-9)) if prev_yes is not None else 0.0
 
-                # Money flow move (%): volume delta %
+                # Flow moves (volume)
                 vol_delta = vol - prev_vol
-                vol_move_pct = (abs(vol_delta) / max(prev_vol, 1e-9)) if prev_vol is not None else 0.0
-
-                score = _score(vol=vol, liq=liq, spread=spread, move_abs=move_abs)
-
-                # Gate: allow alerts if any of these is strong
-                strong_enough = (
-                    score >= SCORE_MIN
-                    or spread >= GAP_MIN
-                    or (prev_yes is not None and price_move_pct >= (REARM_PRICE_MOVE_PCT / 100.0))
-                    or (prev_vol is not None and vol_move_pct >= (REARM_VOL_MOVE_PCT / 100.0))
-                )
-                if not strong_enough:
-                    last_yes[key] = yes
-                    last_vol[key] = vol
-                    continue
-
-                # Cooldown + rearm
-                t_last = last_sent_ts.get(key, 0.0)
-                cooldown_ok = (now - t_last) >= COOLDOWN_SEC
-                rearm_ok = (
-                    (prev_yes is not None and price_move_pct >= (REARM_PRICE_MOVE_PCT / 100.0))
-                    or (prev_vol is not None and vol_move_pct >= (REARM_VOL_MOVE_PCT / 100.0))
-                )
-                if not cooldown_ok and not rearm_ok:
-                    last_yes[key] = yes
-                    last_vol[key] = vol
-                    continue
-
-                # WEATHER EDGE path (only for your cities)
-                weather_info = None
-                if is_weather_market(title):
-                    try:
-                        weather_info = weather_edge_decision(title, yes)
-                    except Exception:
-                        weather_info = None
-
-                tier = _tier(score=score, spread=spread, move_abs=move_abs)
-
-                # Recommendation
-                if weather_info:
-                    action = weather_info["action"]
-                    why = weather_info["why"]
-                    extra_line = (
-                        f"🌦 WeatherEdge: {weather_info['city']} | {weather_info['date']}\n"
-                        f"🔎 Rule: {weather_info['cond']} | Forecast≈{weather_info['forecast_point']:.1f}"
-                        f"{('°'+weather_info['units']) if weather_info['units'] in ['C','F'] else ' '+weather_info['units']}"
-                    )
-                else:
-                    action, why = recommend_general(yes, prev_yes)
-                    extra_line = ""
-
-                no = _clamp(1.0 - yes, 0.0, 1.0)
-
-                spread_cents = spread * 100.0
-                bid_s = f"{bid:.3f}" if bid is not None else "n/a"
-                ask_s = f"{ask:.3f}" if ask is not None else "n/a"
-
-                # Make FLOW MOVE% explicit (money in/out)
+                flow_move_pct = (abs(vol_delta) / max(prev_vol, 1e-9)) if prev_vol is not None else 0.0
                 flow_dir = "IN" if vol_delta >= 0 else "OUT"
-                flow_amt = abs(vol_delta)
+
+                # Arbitrage (if we can see both sides asks)
+                side = _extract_side_prices(m)
+                arb = find_arbitrage(side)
+
+                # High move trigger
+                high_move = (
+                    (prev_yes is not None and (price_move_pct >= PRICE_MOVE_ALERT_PCT or abs_move >= ABS_PRICE_MOVE_ALERT))
+                    or (prev_vol is not None and flow_move_pct >= FLOW_MOVE_ALERT_PCT)
+                )
+
+                # Focus: prioritize city markets (London/Buenos Aires/Ankara) but still scan all
+                focus = is_focus_city_market(title)
+
+                # Decide if we should alert
+                should_alert = False
+                alert_type = ""
+                if arb is not None:
+                    should_alert = True
+                    alert_type = "ARB"
+                elif high_move and (focus or vol >= (VOL_MIN * 1.5) or liq >= (LIQ_MIN * 1.5)):
+                    should_alert = True
+                    alert_type = "MOVE"
+
+                if not should_alert:
+                    last_yes[key] = yes
+                    last_vol[key] = vol
+                    continue
+
+                # Cooldown (but let ARB through faster)
+                cooldown = 240 if alert_type == "ARB" else COOLDOWN_SEC
+                t_last = last_sent_ts.get(key, 0.0)
+                if (now - t_last) < cooldown and alert_type != "ARB":
+                    last_yes[key] = yes
+                    last_vol[key] = vol
+                    continue
+
+                # News context
+                q = build_query_from_title(title)
+                headlines = fetch_gdelt_headlines(q, max_items=3)
+                news_block = "\n".join(headlines) if headlines else "• (no recent headlines found via GDELT)"
+
+                # Compose recommendation (clear)
+                if alert_type == "ARB":
+                    rec = "ENTER BOTH SIDES (ARBITRAGE)"
+                    ya = arb["yes_ask"]
+                    na = arb["no_ask"]
+                    locked = arb["locked_profit"]
+                    why = f"YES_ASK + NO_ASK = {arb['sum']:.3f} < 1.000 (buffer {ARB_BUFFER:.3f}) → locked profit ≈ {locked*100:.2f}%"
+                    action_line = f"🎯 ACTION: Buy YES @ {ya:.3f} AND Buy NO @ {na:.3f}"
+                else:
+                    rec = explicit_trade_side_from_move(yes, prev_yes)
+                    why = f"High move detected: PriceMove={_pct(price_move_pct)} (abs {abs_move:.3f}) | FlowMove%={_pct(flow_move_pct)} ({flow_dir} {abs(vol_delta):,.0f})"
+                    action_line = f"🎯 ACTION: {rec}"
+
+                # Extra: show whether move favors YES/NO
+                move_dir = move_direction_label(yes, prev_yes)
 
                 msg = (
-                    f"🚨 {tier} | ALERT\n"
-                    f"✅ RECOMMENDATION: {action}\n"
+                    f"🚨 {alert_type} ALERT\n"
+                    f"{action_line}\n"
                     f"🧠 Reason: {why}\n"
-                    f"💰 YES={yes:.3f} | NO≈{no:.3f} | PriceMove={_pct(price_move_pct)}\n"
-                    f"💸 FlowMove: {flow_dir} {flow_amt:,.0f} | FlowMove%={_pct(vol_move_pct)}  (Vol {prev_vol:,.0f}→{vol:,.0f})\n"
-                    f"📌 Spread: {spread_cents:.2f}¢ ({_pct(spread)}) [bid={bid_s} / ask={ask_s}]\n"
-                    f"📊 Liq={liq:,.0f} | Score={score:.2f}\n"
-                    f"{extra_line + chr(10) if extra_line else ''}"
+                    f"💰 YES={yes:.3f} | NO≈{(1-yes):.3f} | MoveDir={move_dir}\n"
+                    f"💸 Flow: {flow_dir} {abs(vol_delta):,.0f} | FlowMove%={_pct(flow_move_pct)}  (Vol {prev_vol:,.0f}→{vol:,.0f})\n"
+                    f"📊 Liq={liq:,.0f}\n"
+                    f"🗞 News (last 24h):\n{news_block}\n"
                     f"📝 {title}\n"
                     f"{url}"
                 )
 
                 send_telegram(msg)
                 last_sent_ts[key] = now
-                alerts_sent += 1
+                sent += 1
 
-                # cap per scan (aggressive but not insane)
-                if alerts_sent >= 16:
+                # Anti-flood cap
+                if sent >= 18:
                     break
 
                 last_yes[key] = yes
