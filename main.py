@@ -5,213 +5,320 @@ import os
 import time
 import math
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 
 # =========================
-# ENV / CONFIG
+# CONFIG (agressividade)
 # =========================
+SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "300"))  # 5 min
 
-POLY_ENDPOINT = os.getenv("POLY_ENDPOINT", "https://polymarket.com/api/markets")
+# ALERTA "ENTRAR" (EDGE)
+EDGE_MIN_ABS = float(os.getenv("EDGE_MIN_ABS", "0.015"))         # 1.5c de edge implícito
+EDGE_MIN_REL = float(os.getenv("EDGE_MIN_REL", "0.030"))         # 3% relativo
+LIQ_MIN = float(os.getenv("LIQ_MIN", "15000"))                   # liquidez mínima
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# ALERTA "WATCH" (quase-edge, pra ficar constante)
+WATCH_MIN_ABS = float(os.getenv("WATCH_MIN_ABS", "0.010"))       # 1.0c
+WATCH_MIN_REL = float(os.getenv("WATCH_MIN_REL", "0.020"))       # 2%
+WATCH_LIQ_MIN = float(os.getenv("WATCH_LIQ_MIN", "8000"))        # menor q EDGE
 
-INTERVAL = int(os.getenv("INTERVAL_SEC", "600"))   # 10 min default
-TOP_N = int(os.getenv("TOP_N", "7"))
+# MOVES (capturar cedo)
+MOVE_MIN_PCT = float(os.getenv("MOVE_MIN_PCT", "4.0"))           # 4% de mudança no preço
+VOL_MIN_DELTA = float(os.getenv("VOL_MIN_DELTA", "20000"))       # +20k de volume desde último scan
 
-MIN_LIQ = float(os.getenv("MIN_LIQ", "20000"))
-MIN_VOL = float(os.getenv("MIN_VOL", "25000"))
+# Anti-spam
+COOLDOWN_EDGE_SEC = int(os.getenv("COOLDOWN_EDGE_SEC", "2700"))  # 45 min por mercado (EDGE)
+COOLDOWN_WATCH_SEC = int(os.getenv("COOLDOWN_WATCH_SEC", "1200"))# 20 min por mercado (WATCH)
+MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "12"))# limita spam por rodada
 
-ARB_CUSHION = float(os.getenv("ARB_CUSHION", "0.010"))  # 1%
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.14"))
+# Fonte de mercados (Gamma / Polymarket)
+GAMMA_URL = os.getenv("GAMMA_URL", "https://gamma-api.polymarket.com/markets")
 
-MIN_PRICE = 0.02
-MAX_PRICE = 0.98
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-BASE_MIN_EDGE = float(os.getenv("BASE_MIN_EDGE", "0.035"))
-MAX_ENTRY_YES = float(os.getenv("MAX_ENTRY_YES", "0.72"))
-
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "1800"))
-REQUIRE_2_CYCLES = os.getenv("REQUIRE_2_CYCLES", "0") == "1"
-
-# =========================
-# STATE
-# =========================
-
-sent_cache = {}
-seen_once = set()
 
 # =========================
-# TELEGRAM
+# Telegram
 # =========================
-
-def send(msg):
+def tg_send(text: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID.")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg,
-        "disable_web_page_preview": True
+        "text": text,
+        "disable_web_page_preview": True,
     }
     try:
-        requests.post(url, json=payload, timeout=10)
-    except:
-        pass
+        requests.post(url, json=payload, timeout=20).raise_for_status()
+    except Exception as e:
+        print("Telegram error:", e)
+
 
 # =========================
-# HELPERS
+# Polymarket fetch
 # =========================
+def fetch_markets():
+    # Pegamos muitos e filtramos localmente
+    params = {"limit": 200, "offset": 0, "active": "true"}
+    allm = []
+    while True:
+        r = requests.get(GAMMA_URL, params=params, timeout=25)
+        r.raise_for_status()
+        chunk = r.json()
+        if not isinstance(chunk, list) or not chunk:
+            break
+        allm.extend(chunk)
+        if len(chunk) < params["limit"]:
+            break
+        params["offset"] += params["limit"]
+        if params["offset"] >= 2000:
+            break
+    return allm
 
-def cooldown_ok(k):
-    return time.time() - sent_cache.get(k, 0) > COOLDOWN_SEC
 
-def clamp(x, a, b):
-    return max(a, min(b, x))
-
-def score(edge, liq, vol, spread):
-    e = clamp(edge / 0.12, 0, 1)
-    l = clamp(math.log10(max(liq, 1)) / 6, 0, 1)
-    v = clamp(math.log10(max(vol, 1)) / 6, 0, 1)
-    s = clamp(spread / MAX_SPREAD, 0, 1)
-    return round(clamp((0.55*e + 0.25*l + 0.25*v - 0.25*s), 0, 1) * 10, 2)
-
-def dyn_min_edge(liq, vol):
-    boost = 0
-    if liq > 250000: boost += 0.01
-    if vol > 500000: boost += 0.01
-    return max(0.03, BASE_MIN_EDGE - boost)
-
-def fetch():
-    r = requests.get(POLY_ENDPOINT, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-# =========================
-# PARSE
-# =========================
-
-def parse(m):
+def safe_float(x, default=0.0):
     try:
-        yes = float(m["yesPrice"])
-        no = float(m["noPrice"])
-        liq = float(m.get("liquidity", 0))
-        vol = float(m.get("volume", 0))
-        title = m.get("title", "Untitled")
-        mid = str(m.get("id"))
-        slug = m.get("slug", "")
+        if x is None:
+            return default
+        return float(x)
     except:
-        return None
+        return default
 
-    if not (MIN_PRICE <= yes <= MAX_PRICE and MIN_PRICE <= no <= MAX_PRICE):
-        return None
 
-    spread = abs((1 - no) - yes)
+def now_ts():
+    return int(time.time())
 
-    return {
-        "id": mid,
-        "title": title,
-        "yes": yes,
-        "no": no,
-        "liq": liq,
-        "vol": vol,
-        "spread": spread,
-        "url": f"https://polymarket.com/market/{slug}" if slug else ""
-    }
 
-# =========================
-# DETECTORS
-# =========================
+def pct(a, b):
+    # % change from a -> b
+    if a <= 0:
+        return 0.0
+    return ((b - a) / a) * 100.0
 
-def classic_arb(x):
-    s = x["yes"] + x["no"]
-    gap = 1 - s
-    if gap <= ARB_CUSHION: return None
-    if x["liq"] < MIN_LIQ or x["vol"] < MIN_VOL: return None
-    if x["spread"] > MAX_SPREAD: return None
 
-    key = x["id"] + "|ARB"
-    if REQUIRE_2_CYCLES and key not in seen_once:
-        seen_once.add(key); return None
-    if not cooldown_ok(key): return None
+def clamp01(x):
+    return max(0.0, min(1.0, x))
 
-    sc = score(gap, x["liq"], x["vol"], x["spread"])
-    return ("ARB", key, gap, sc, x)
-
-def mispricing_yes(x):
-    if x["liq"] < MIN_LIQ or x["vol"] < MIN_VOL: return None
-    if x["spread"] > MAX_SPREAD: return None
-    if x["yes"] > MAX_ENTRY_YES: return None
-
-    fair = (x["yes"] + (1 - x["no"])) / 2
-    edge = fair - x["yes"]
-    if edge < dyn_min_edge(x["liq"], x["vol"]): return None
-
-    key = x["id"] + "|YES"
-    if REQUIRE_2_CYCLES and key not in seen_once:
-        seen_once.add(key); return None
-    if not cooldown_ok(key): return None
-
-    sc = score(edge, x["liq"], x["vol"], x["spread"])
-    return ("YES", key, edge, sc, x)
 
 # =========================
-# MAIN LOOP
+# Market parsing helpers
 # =========================
+def market_url(m):
+    # gamma costuma ter "slug"
+    slug = m.get("slug")
+    if slug:
+        return f"https://polymarket.com/market/{slug}"
+    # fallback
+    mid = m.get("id") or m.get("marketId")
+    if mid:
+        return f"https://polymarket.com/market/{mid}"
+    return "https://polymarket.com"
+
+
+def get_best_yes_price(m):
+    # Dependendo do objeto, vem em:
+    # - m["outcomes"] / m["outcomePrices"]
+    # - m["bestBid"]/["bestAsk"] etc
+    # Aqui usamos a forma mais comum: "outcomePrices" (lista de strings)
+    prices = m.get("outcomePrices") or m.get("outcome_prices")
+    outcomes = m.get("outcomes") or m.get("outcomeNames") or m.get("outcome_names")
+
+    if isinstance(prices, list) and len(prices) >= 2:
+        # normalmente [YES, NO]
+        yes = safe_float(prices[0], 0.0)
+        no = safe_float(prices[1], 0.0)
+        return clamp01(yes), clamp01(no)
+
+    # fallback: tentar mapear via outcomes dict-like
+    if isinstance(outcomes, list) and isinstance(prices, dict):
+        # ex: prices {"Yes":"0.52","No":"0.48"}
+        yes = None
+        no = None
+        for k, v in prices.items():
+            kk = str(k).lower()
+            if "yes" in kk:
+                yes = safe_float(v, 0.0)
+            if "no" in kk:
+                no = safe_float(v, 0.0)
+        if yes is not None and no is not None:
+            return clamp01(yes), clamp01(no)
+
+    # último fallback: alguns retornos têm "yesPrice"
+    yes = safe_float(m.get("yesPrice"), 0.0)
+    no = safe_float(m.get("noPrice"), 0.0)
+    if yes > 0 and no > 0:
+        return clamp01(yes), clamp01(no)
+
+    return None, None
+
+
+def get_liquidity(m):
+    # gamma usa "liquidityNum" ou "liquidity"
+    return safe_float(m.get("liquidityNum") or m.get("liquidity") or m.get("liquidity_num"), 0.0)
+
+
+def get_volume(m):
+    # gamma usa "volumeNum" ou "volume"
+    return safe_float(m.get("volumeNum") or m.get("volume") or m.get("volume_num"), 0.0)
+
+
+def title(m):
+    return (m.get("question") or m.get("title") or m.get("name") or "Market").strip()
+
+
+# =========================
+# Logic
+# =========================
+# cache p/ moves e cooldown
+last_seen = {}       # market_id -> dict(prices, vol, ts)
+last_sent = {}       # (market_id, kind) -> ts
+
+def market_id(m):
+    return str(m.get("id") or m.get("marketId") or m.get("conditionId") or m.get("slug") or title(m))
+
+
+def should_send(mid, kind, cooldown_sec):
+    key = (mid, kind)
+    ts = last_sent.get(key, 0)
+    return (now_ts() - ts) >= cooldown_sec
+
+
+def mark_sent(mid, kind):
+    last_sent[(mid, kind)] = now_ts()
+
+
+def compute_edge(yes, no):
+    # Em mercado binário, um proxy simples:
+    # se YES + NO < 1.0 => "gap" (subprecificado o par)
+    # se YES + NO > 1.0 => "overround" (caro)
+    s = yes + no
+    gap = 1.0 - s
+    # gap > 0 é “boa” (tem espaço). gap < 0 é “caro”.
+    return gap
+
+
+def decide_side(yes):
+    # Heurística: se YES muito barato (<0.5), potencialmente valor em YES
+    # se YES caro (>0.5), potencialmente valor em NO
+    # (isso NÃO é “probabilidade real”, é só para recomendação clara)
+    if yes <= 0.50:
+        return "YES"
+    return "NO"
+
+
+def format_money(x):
+    if x >= 1_000_000:
+        return f"{x/1_000_000:.2f}M"
+    if x >= 1_000:
+        return f"{x/1_000:.1f}K"
+    return f"{x:.0f}"
+
+
+def scan():
+    markets = fetch_markets()
+    alerts = []
+
+    for m in markets:
+        mid = market_id(m)
+        yes, no = get_best_yes_price(m)
+        if yes is None or no is None:
+            continue
+
+        liq = get_liquidity(m)
+        vol = get_volume(m)
+        if liq <= 0:
+            continue
+
+        edge = compute_edge(yes, no)
+        edge_abs = edge
+        edge_rel = (edge_abs / max(0.01, (yes + no)))  # relativo ao total do par
+
+        # Move/volume delta
+        prev = last_seen.get(mid)
+        move_pct = 0.0
+        vol_delta = 0.0
+        if prev:
+            move_pct = max(abs(pct(prev["yes"], yes)), abs(pct(prev["no"], no)))
+            vol_delta = vol - prev["vol"]
+
+        # atualizar cache
+        last_seen[mid] = {"yes": yes, "no": no, "vol": vol, "ts": now_ts()}
+
+        q = title(m)
+        url = market_url(m)
+
+        # Classificação
+        is_edge = (edge_abs >= EDGE_MIN_ABS and edge_rel >= EDGE_MIN_REL and liq >= LIQ_MIN)
+        is_watch = (edge_abs >= WATCH_MIN_ABS and edge_rel >= WATCH_MIN_REL and liq >= WATCH_LIQ_MIN)
+
+        is_move = (move_pct >= MOVE_MIN_PCT and vol_delta >= VOL_MIN_DELTA and liq >= WATCH_LIQ_MIN)
+
+        # Recomendação
+        side = decide_side(yes)
+        if side == "YES":
+            rec_line = "🎯 AÇÃO: considerar entrada em **YES** (a favor do evento)"
+        else:
+            rec_line = "🎯 AÇÃO: considerar entrada em **NO** (contra o evento)"
+
+        reason_bits = [
+            f"Gap={edge_abs:+.3f}",
+            f"YES={yes:.3f}",
+            f"NO={no:.3f}",
+            f"Liq={format_money(liq)}",
+            f"Vol={format_money(vol)}"
+        ]
+        if prev:
+            reason_bits.append(f"Move={move_pct:.1f}%")
+            reason_bits.append(f"ΔVol={format_money(vol_delta)}")
+
+        reason = " | ".join(reason_bits)
+
+        # Decide alert type
+        if is_edge and should_send(mid, "EDGE", COOLDOWN_EDGE_SEC):
+            alerts.append((
+                3,  # prioridade
+                f"🚨 EDGE (entrada)\n🧩 {q}\n{rec_line}\n🧠 Motivo: {reason}\n🔗 {url}"
+            ))
+            mark_sent(mid, "EDGE")
+
+        elif is_watch and should_send(mid, "WATCH", COOLDOWN_WATCH_SEC):
+            alerts.append((
+                2,
+                f"👀 WATCH (quase-edge)\n🧩 {q}\n{rec_line}\n🧠 Motivo: {reason}\n🔗 {url}"
+            ))
+            mark_sent(mid, "WATCH")
+
+        elif is_move and should_send(mid, "MOVE", COOLDOWN_WATCH_SEC):
+            alerts.append((
+                1,
+                f"⚡ MOVE + VOLUME (cedo)\n🧩 {q}\n{rec_line}\n🧠 Motivo: {reason}\n🔗 {url}"
+            ))
+            mark_sent(mid, "MOVE")
+
+        if len(alerts) >= MAX_ALERTS_PER_SCAN:
+            break
+
+    # ordenar por prioridade desc
+    alerts.sort(key=lambda x: x[0], reverse=True)
+    return [a[1] for a in alerts]
+
 
 def main():
-    send("⚡ POLY EDGE BOT ONLINE\nModo: ARB + MISPRICING")
-
+    tg_send("🤖 Bot ON: modo mais constante (EDGE + WATCH + MOVE).")
     while True:
         try:
-            raw = fetch()
-            alerts = []
-
-            for m in raw:
-                x = parse(m)
-                if not x: continue
-
-                a = classic_arb(x)
-                if a: alerts.append(a)
-
-                y = mispricing_yes(x)
-                if y: alerts.append(y)
-
-            alerts.sort(key=lambda z: z[3], reverse=True)
-
-            for t, key, edge, sc, x in alerts[:TOP_N]:
-                sent_cache[key] = time.time()
-
-                if t == "ARB":
-                    msg = (
-                        "🚨 ARBITRAGEM\n"
-                        "🎯 AÇÃO: ARB (YES + NO)\n\n"
-                        f"{x['title']}\n\n"
-                        f"YES: {x['yes']:.3f} | NO: {x['no']:.3f}\n"
-                        f"GAP: {round(edge*100,2)}%\n"
-                        f"Score: {sc}/10\n\n"
-                        f"{x['url']}"
-                    )
-                else:
-                    msg = (
-                        "🚨 MISPRICING\n"
-                        "🎯 AÇÃO: ENTRAR YES\n\n"
-                        f"{x['title']}\n\n"
-                        f"YES: {x['yes']:.3f}\n"
-                        f"EDGE: +{round(edge*100,2)}%\n"
-                        f"Score: {sc}/10\n\n"
-                        f"{x['url']}"
-                    )
-
-                send(msg)
-
-            if not alerts:
-                print(f"[{datetime.utcnow()}] sem oportunidades")
-
+            msgs = scan()
+            for msg in msgs:
+                tg_send(msg)
+                time.sleep(1.2)
         except Exception as e:
-            print("Erro:", e)
+            # erro silencioso (sem spam)
+            print("scan error:", e)
+        time.sleep(SCAN_EVERY_SECONDS)
 
-        time.sleep(INTERVAL)
 
 if __name__ == "__main__":
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("TELEGRAM TOKEN / CHAT ID ausente")
     main()
