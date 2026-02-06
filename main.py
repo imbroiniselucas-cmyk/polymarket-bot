@@ -14,9 +14,15 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 GAMMA_URL = os.getenv("GAMMA_URL", "https://gamma-api.polymarket.com").rstrip("/")
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))              # 2 min
-MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "40"))
-REPEAT_COOLDOWN_SEC = int(os.getenv("REPEAT_COOLDOWN_SEC", "60")) # 1 min
+# bem agressivo
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))               # 1 min
+MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "60"))
+
+# por padrão: SEM dedupe (0). Se quiser, coloque 30/60.
+REPEAT_COOLDOWN_SEC = int(os.getenv("REPEAT_COOLDOWN_SEC", "0"))
+
+# a cada X min manda um “resumo” caso esteja tudo zerado
+DEBUG_EVERY_SEC = int(os.getenv("DEBUG_EVERY_SEC", "180"))        # 3 min
 
 # =========================
 # HELPERS
@@ -40,22 +46,51 @@ def clamp01(x):
 def tg_api(method: str, payload=None, timeout=20):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
     r = requests.post(url, json=payload or {}, timeout=timeout)
-    return r.status_code, r.text
+    return r.status_code, r.text, r.headers
 
 def tg_send(text: str) -> bool:
+    """
+    Anti-rate-limit:
+    - se 429, espera e tenta mais uma vez
+    - loga erro sempre
+    """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID.")
         return False
 
-    status, body = tg_api("sendMessage", {
+    payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "disable_web_page_preview": True,
-    })
-    if status != 200:
-        print("❌ Telegram sendMessage failed:", status, body[:500])
+    }
+
+    status, body, headers = tg_api("sendMessage", payload)
+    if status == 200:
+        return True
+
+    # rate limit
+    if status == 429:
+        # tenta extrair "retry_after"
+        retry_after = 2
+        try:
+            # body costuma ter {"parameters":{"retry_after":X}}
+            if "retry_after" in body:
+                import re
+                m = re.search(r"retry_after\":\s*(\d+)", body)
+                if m:
+                    retry_after = int(m.group(1))
+        except Exception:
+            pass
+        print(f"⚠️ Telegram 429 rate limit. Sleeping {retry_after}s then retry.")
+        time.sleep(retry_after)
+        status2, body2, _ = tg_api("sendMessage", payload)
+        if status2 == 200:
+            return True
+        print("❌ Telegram send failed after retry:", status2, body2[:400])
         return False
-    return True
+
+    print("❌ Telegram sendMessage failed:", status, body[:400])
+    return False
 
 def gamma_get(path, params=None, timeout=25):
     url = GAMMA_URL + path
@@ -82,9 +117,9 @@ def market_url(market: dict):
     return "https://polymarket.com"
 
 # =========================
-# FETCH (robusto)
+# FETCH MARKETS (robusto)
 # =========================
-def fetch_markets(limit=700):
+def fetch_markets(limit=900):
     attempts = [
         ("/markets", {"active":"true","closed":"false","limit":str(limit),"offset":"0","order":"volume24hr","ascending":"false"}),
         ("/markets", {"active":"true","closed":"false","limit":str(limit),"offset":"0"}),
@@ -93,24 +128,26 @@ def fetch_markets(limit=700):
     ]
 
     last_err = None
+    used = None
     for path, params in attempts:
         try:
             data = gamma_get(path, params=params)
             lst = extract_list(data)
             if lst:
+                used = path
                 if path == "/events":
                     markets = []
                     for ev in lst:
                         if isinstance(ev, dict) and isinstance(ev.get("markets"), list):
                             markets.extend(ev["markets"])
                     if markets:
-                        return markets, None, path
-                return lst, None, path
+                        return markets, None, used
+                return lst, None, used
         except Exception as e:
             last_err = f"{path} failed: {repr(e)}"
             print(last_err)
 
-    return [], last_err, None
+    return [], last_err, used
 
 # =========================
 # PRICE PARSER
@@ -143,7 +180,7 @@ def parse_yes_no(market: dict):
     return yes, no
 
 def decide_buy(yes: float, no: float):
-    # BUY-only, super agressivo
+    # BUY-only: sempre escolhe um lado
     if yes < 0.5:
         return "BUY_YES"
     if yes > 0.5:
@@ -174,11 +211,13 @@ def format_buy(market: dict, rec: str, yes: float, no: float):
     )
 
 # =========================
-# DEDUPE leve (mas repete rápido)
+# OPTIONAL DEDUPE
 # =========================
 last_sent = {}
 
 def should_send(key: str):
+    if REPEAT_COOLDOWN_SEC <= 0:
+        return True
     now = time.time()
     ts = last_sent.get(key, 0)
     if now - ts >= REPEAT_COOLDOWN_SEC:
@@ -193,96 +232,53 @@ def make_key(market: dict, rec: str, yes: float, no: float):
     return f"{mid}:{rec}:{bucket}"
 
 # =========================
-# BOOT DIAGNOSTICS
-# =========================
-def boot_diagnostics():
-    print("BOOT_OK: main.py running")
-
-    # 1) mostra no log se env chegou
-    print("ENV TELEGRAM_TOKEN len:", len(TELEGRAM_TOKEN))
-    print("ENV TELEGRAM_CHAT_ID:", TELEGRAM_CHAT_ID if TELEGRAM_CHAT_ID else "(empty)")
-    print("GAMMA_URL:", GAMMA_URL)
-
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("❌ Telegram env missing. Bot will NOT be able to message.")
-        return False
-
-    # 2) valida token
-    st, body = tg_api("getMe", {})
-    if st != 200:
-        print("❌ getMe failed:", st, body[:500])
-        # tenta avisar? não dá, pois token pode estar inválido
-        return False
-
-    # 3) força mensagem de teste (se isso não chegar, nada vai chegar)
-    ok = tg_send(f"✅ BOOT TEST: Telegram OK. Bot iniciou em {now_utc()}.")
-    if not ok:
-        # manda detalhes do erro no log (já sai acima)
-        return False
-
-    # 4) valida fetch de mercados e manda contagem no Telegram
-    markets, err, used = fetch_markets(limit=50)
-    if not markets:
-        tg_send(f"⚠️ BOOT TEST: Gamma retornou 0 mercados.\nErro: {err}\nHora: {now_utc()}")
-        return True
-
-    tg_send(f"✅ BOOT TEST: Gamma OK. mercados={len(markets)} (endpoint {used}). Hora: {now_utc()}")
-
-    # 5) envia 3 BUYs “de teste” (pra provar que alertas chegam)
-    sent = 0
-    for m in markets[:10]:
-        yes, no = parse_yes_no(m)
-        if yes is None:
-            continue
-        rec = decide_buy(yes, no)
-        tg_send("🧪 TEST BUY (amostra)\n" + format_buy(m, rec, yes, no))
-        sent += 1
-        if sent >= 3:
-            break
-
-    return True
-
-# =========================
-# MAIN LOOP
+# MAIN
 # =========================
 def main():
-    telegram_ok = boot_diagnostics()
+    print("BOOT_OK: main.py running")
+    tg_send(f"✅ Bot ON | BUY-only | sem score | poll={POLL_SECONDS}s | max/cycle={MAX_ALERTS_PER_CYCLE} | dedupe={REPEAT_COOLDOWN_SEC}s")
+
+    last_debug = 0
 
     while True:
-        try:
-            markets, err, used = fetch_markets(limit=700)
+        markets, err, used = fetch_markets(limit=900)
+        if not markets:
+            print(f"[{now_utc()}] markets=0 err={err}")
+            tg_send(f"⚠️ Gamma retornou 0 mercados.\nEndpoint: {used}\nErro: {err}\nHora: {now_utc()}")
+            time.sleep(POLL_SECONDS)
+            continue
 
-            if not markets:
-                # se Telegram ok, avisa a cada ~10 min
-                print(f"[{now_utc()}] markets=0 err={err}")
-                if telegram_ok:
-                    tg_send(f"⚠️ API vazia/erro agora.\nEndpoint: {used}\nErro: {err}\nHora: {now_utc()}")
-                    telegram_ok = True
-                time.sleep(POLL_SECONDS)
+        parse_ok = 0
+        candidates = []
+
+        for m in markets:
+            yes, no = parse_yes_no(m)
+            if yes is None:
                 continue
+            parse_ok += 1
 
-            candidates = []
-            for m in markets:
-                yes, no = parse_yes_no(m)
-                if yes is None:
-                    continue
-                rec = decide_buy(yes, no)
-                key = make_key(m, rec, yes, no)
-                if should_send(key):
-                    candidates.append((m, rec, yes, no))
+            rec = decide_buy(yes, no)
+            key = make_key(m, rec, yes, no)
+            if should_send(key):
+                candidates.append((m, rec, yes, no))
 
-            # manda bastante
-            sent = 0
-            for m, rec, yes, no in candidates[:MAX_ALERTS_PER_CYCLE]:
-                if tg_send(format_buy(m, rec, yes, no)):
-                    sent += 1
+        sent = 0
+        for m, rec, yes, no in candidates[:MAX_ALERTS_PER_CYCLE]:
+            if tg_send(format_buy(m, rec, yes, no)):
+                sent += 1
 
-            print(f"[{now_utc()}] markets={len(markets)} candidates={len(candidates)} sent={sent} endpoint={used}")
+        print(f"[{now_utc()}] markets={len(markets)} parse_ok={parse_ok} candidates={len(candidates)} sent={sent} endpoint={used}")
 
-        except Exception as e:
-            print("Loop exception:", repr(e))
-            if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-                tg_send(f"⚠️ Loop exception: {repr(e)}\nHora: {now_utc()}")
+        # Debug no Telegram (pra nunca ficar “mudo”)
+        now = time.time()
+        if sent == 0 and (now - last_debug) >= DEBUG_EVERY_SEC:
+            tg_send(
+                "🧩 DEBUG (sem alertas enviados)\n"
+                f"markets={len(markets)} | parse_ok={parse_ok} | candidates={len(candidates)} | sent={sent}\n"
+                f"endpoint={used} | dedupe={REPEAT_COOLDOWN_SEC}s | max/cycle={MAX_ALERTS_PER_CYCLE}\n"
+                f"Hora: {now_utc()}"
+            )
+            last_debug = now
 
         time.sleep(POLL_SECONDS)
 
