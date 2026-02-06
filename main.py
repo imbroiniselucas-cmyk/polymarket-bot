@@ -3,6 +3,7 @@
 
 import os
 import time
+import json
 import requests
 from datetime import datetime, timezone
 
@@ -14,15 +15,14 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 GAMMA_URL = os.getenv("GAMMA_URL", "https://gamma-api.polymarket.com").rstrip("/")
 
-# bem agressivo
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))               # 1 min
-MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "60"))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))                 # 1 min
+MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "60")) # bem agressivo
+REPEAT_COOLDOWN_SEC = int(os.getenv("REPEAT_COOLDOWN_SEC", "30"))   # repete rápido, mas não a cada loop
+DEBUG_EVERY_SEC = int(os.getenv("DEBUG_EVERY_SEC", "180"))          # 3 min
 
-# por padrão: SEM dedupe (0). Se quiser, coloque 30/60.
-REPEAT_COOLDOWN_SEC = int(os.getenv("REPEAT_COOLDOWN_SEC", "0"))
-
-# a cada X min manda um “resumo” caso esteja tudo zerado
-DEBUG_EVERY_SEC = int(os.getenv("DEBUG_EVERY_SEC", "180"))        # 3 min
+# quantos mercados puxar por ciclo (paginado)
+PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "250"))
+MAX_PAGES = int(os.getenv("MAX_PAGES", "6"))  # 6*250 = 1500 mercados por ciclo
 
 # =========================
 # HELPERS
@@ -46,14 +46,9 @@ def clamp01(x):
 def tg_api(method: str, payload=None, timeout=20):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
     r = requests.post(url, json=payload or {}, timeout=timeout)
-    return r.status_code, r.text, r.headers
+    return r.status_code, r.text
 
 def tg_send(text: str) -> bool:
-    """
-    Anti-rate-limit:
-    - se 429, espera e tenta mais uma vez
-    - loga erro sempre
-    """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID.")
         return False
@@ -64,16 +59,15 @@ def tg_send(text: str) -> bool:
         "disable_web_page_preview": True,
     }
 
-    status, body, headers = tg_api("sendMessage", payload)
+    status, body = tg_api("sendMessage", payload)
+
     if status == 200:
         return True
 
-    # rate limit
+    # rate limit (429)
     if status == 429:
-        # tenta extrair "retry_after"
         retry_after = 2
         try:
-            # body costuma ter {"parameters":{"retry_after":X}}
             if "retry_after" in body:
                 import re
                 m = re.search(r"retry_after\":\s*(\d+)", body)
@@ -81,12 +75,13 @@ def tg_send(text: str) -> bool:
                     retry_after = int(m.group(1))
         except Exception:
             pass
-        print(f"⚠️ Telegram 429 rate limit. Sleeping {retry_after}s then retry.")
+
+        print(f"⚠️ Telegram 429. Sleep {retry_after}s and retry.")
         time.sleep(retry_after)
-        status2, body2, _ = tg_api("sendMessage", payload)
+        status2, body2 = tg_api("sendMessage", payload)
         if status2 == 200:
             return True
-        print("❌ Telegram send failed after retry:", status2, body2[:400])
+        print("❌ Telegram failed after retry:", status2, body2[:400])
         return False
 
     print("❌ Telegram sendMessage failed:", status, body[:400])
@@ -117,58 +112,110 @@ def market_url(market: dict):
     return "https://polymarket.com"
 
 # =========================
-# FETCH MARKETS (robusto)
+# FETCH MARKETS (PAGINADO)
 # =========================
-def fetch_markets(limit=900):
-    attempts = [
-        ("/markets", {"active":"true","closed":"false","limit":str(limit),"offset":"0","order":"volume24hr","ascending":"false"}),
-        ("/markets", {"active":"true","closed":"false","limit":str(limit),"offset":"0"}),
-        ("/markets", {"limit":str(limit),"offset":"0"}),
-        ("/events",  {"active":"true","closed":"false","limit":str(min(limit, 200)),"offset":"0"}),
-    ]
-
+def fetch_markets_paged():
+    """
+    Puxa até PAGE_LIMIT*MAX_PAGES mercados usando offset.
+    """
+    all_markets = []
+    used = "/markets"
     last_err = None
-    used = None
-    for path, params in attempts:
+
+    for page in range(MAX_PAGES):
+        offset = page * PAGE_LIMIT
         try:
-            data = gamma_get(path, params=params)
+            data = gamma_get("/markets", params={
+                "active": "true",
+                "closed": "false",
+                "limit": str(PAGE_LIMIT),
+                "offset": str(offset),
+                "order": "volume24hr",
+                "ascending": "false",
+            })
             lst = extract_list(data)
-            if lst:
-                used = path
-                if path == "/events":
-                    markets = []
-                    for ev in lst:
-                        if isinstance(ev, dict) and isinstance(ev.get("markets"), list):
-                            markets.extend(ev["markets"])
-                    if markets:
-                        return markets, None, used
-                return lst, None, used
+            if not lst:
+                break
+            all_markets.extend(lst)
         except Exception as e:
-            last_err = f"{path} failed: {repr(e)}"
-            print(last_err)
+            last_err = repr(e)
+            break
 
-    return [], last_err, used
+    # fallback: events (às vezes traz outcomePrices mais “pronto”)
+    if not all_markets:
+        try:
+            used = "/events"
+            data = gamma_get("/events", params={
+                "active": "true",
+                "closed": "false",
+                "limit": "200",
+                "offset": "0",
+            })
+            evs = extract_list(data)
+            mkts = []
+            for ev in evs:
+                if isinstance(ev, dict) and isinstance(ev.get("markets"), list):
+                    mkts.extend(ev["markets"])
+            if mkts:
+                return mkts, None, used
+        except Exception as e:
+            last_err = repr(e)
+
+    return all_markets, last_err, used
 
 # =========================
-# PRICE PARSER
+# PARSE YES/NO (CORRIGIDO)
 # =========================
+def parse_outcome_prices(value):
+    """
+    value pode ser:
+    - list: ["0.2","0.8"] ou [0.2,0.8]
+    - string JSON: "[\"0.2\",\"0.8\"]"
+    - string simples: "0.2,0.8" (raro)
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, list):
+        return value
+
+    if isinstance(value, str):
+        s = value.strip()
+        # JSON string
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                arr = json.loads(s)
+                return arr if isinstance(arr, list) else None
+            except Exception:
+                return None
+        # fallback csv
+        if "," in s:
+            parts = [p.strip().strip('"').strip("'") for p in s.split(",")]
+            return parts
+
+    return None
+
 def parse_yes_no(market: dict):
     yes = None
     no = None
 
-    op = market.get("outcomePrices") or market.get("outcome_prices")
+    op_raw = market.get("outcomePrices") or market.get("outcome_prices")
+    op = parse_outcome_prices(op_raw)
+
     if isinstance(op, list) and len(op) >= 2:
         yes = safe_float(op[0], None)
         no  = safe_float(op[1], None)
 
+    # tokens fallback
     if (yes is None or no is None) and isinstance(market.get("tokens"), list):
         toks = market["tokens"]
         if len(toks) >= 2:
             yes = safe_float(toks[0].get("price"), yes)
             no  = safe_float(toks[1].get("price"), no)
 
+    # lastPrice fallback
     if yes is None:
-        lp = market.get("lastPrice") or market.get("last_price")
+        lp = market.get("lastTradePrice") or market.get("lastTradePrice") or market.get("lastPrice") or market.get("last_price")
         yes = safe_float(lp, None)
         if yes is not None and no is None:
             no = 1.0 - yes
@@ -179,8 +226,10 @@ def parse_yes_no(market: dict):
         return None, None
     return yes, no
 
+# =========================
+# BUY ONLY
+# =========================
 def decide_buy(yes: float, no: float):
-    # BUY-only: sempre escolhe um lado
     if yes < 0.5:
         return "BUY_YES"
     if yes > 0.5:
@@ -189,8 +238,8 @@ def decide_buy(yes: float, no: float):
 
 def format_buy(market: dict, rec: str, yes: float, no: float):
     title = (market.get("question") or market.get("title") or "Market").strip()
-    liq = safe_float(market.get("liquidity"), 0.0) or 0.0
-    vol24 = safe_float(market.get("volume24hr") or market.get("volume24h"), 0.0) or 0.0
+    liq = safe_float(market.get("liquidity") or market.get("liquidityNum") or market.get("liquidity_num"), 0.0) or 0.0
+    vol24 = safe_float(market.get("volume24hr") or market.get("volume24h") or market.get("volumeNum"), 0.0) or 0.0
     url = market_url(market)
 
     if rec == "BUY_YES":
@@ -211,7 +260,7 @@ def format_buy(market: dict, rec: str, yes: float, no: float):
     )
 
 # =========================
-# OPTIONAL DEDUPE
+# DEDUPE (RÁPIDO)
 # =========================
 last_sent = {}
 
@@ -236,14 +285,14 @@ def make_key(market: dict, rec: str, yes: float, no: float):
 # =========================
 def main():
     print("BOOT_OK: main.py running")
-    tg_send(f"✅ Bot ON | BUY-only | sem score | poll={POLL_SECONDS}s | max/cycle={MAX_ALERTS_PER_CYCLE} | dedupe={REPEAT_COOLDOWN_SEC}s")
+    tg_send(f"✅ Bot ON | BUY-only | parse FIXED | poll={POLL_SECONDS}s | pages={MAX_PAGES}x{PAGE_LIMIT} | max/cycle={MAX_ALERTS_PER_CYCLE}")
 
     last_debug = 0
 
     while True:
-        markets, err, used = fetch_markets(limit=900)
+        markets, err, used = fetch_markets_paged()
+
         if not markets:
-            print(f"[{now_utc()}] markets=0 err={err}")
             tg_send(f"⚠️ Gamma retornou 0 mercados.\nEndpoint: {used}\nErro: {err}\nHora: {now_utc()}")
             time.sleep(POLL_SECONDS)
             continue
@@ -267,15 +316,14 @@ def main():
             if tg_send(format_buy(m, rec, yes, no)):
                 sent += 1
 
-        print(f"[{now_utc()}] markets={len(markets)} parse_ok={parse_ok} candidates={len(candidates)} sent={sent} endpoint={used}")
+        print(f"[{now_utc()}] markets={len(markets)} parse_ok={parse_ok} candidates={len(candidates)} sent={sent} used={used}")
 
-        # Debug no Telegram (pra nunca ficar “mudo”)
         now = time.time()
         if sent == 0 and (now - last_debug) >= DEBUG_EVERY_SEC:
             tg_send(
                 "🧩 DEBUG (sem alertas enviados)\n"
                 f"markets={len(markets)} | parse_ok={parse_ok} | candidates={len(candidates)} | sent={sent}\n"
-                f"endpoint={used} | dedupe={REPEAT_COOLDOWN_SEC}s | max/cycle={MAX_ALERTS_PER_CYCLE}\n"
+                f"endpoint={used} | cooldown={REPEAT_COOLDOWN_SEC}s | max/cycle={MAX_ALERTS_PER_CYCLE}\n"
                 f"Hora: {now_utc()}"
             )
             last_debug = now
