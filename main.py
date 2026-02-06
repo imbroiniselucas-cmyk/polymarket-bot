@@ -2,32 +2,28 @@
 # -*- coding: utf-8 -*-
 
 """
-Polymarket Opportunity Bot (Telegram)
-- Only sends BUY (entry) alerts
-- Only sends alerts with score >= MIN_SCORE (default 35)
-- Designed to be "quiet" and actionable
+Polymarket BUY-ONLY Alert Bot (Telegram)
+- Only BUY alerts (entry)
+- Score threshold >= MIN_SCORE (default 30)
+- Aggressive: avoids over-strict gating (so it doesn't go silent)
+- Still avoids the worst "spread traps"
 
-ENV required:
+Required ENV:
   TELEGRAM_TOKEN
   TELEGRAM_CHAT_ID
+  POLY_ENDPOINT   (your working JSON endpoint returning markets)
 
-Optional ENV:
-  MIN_SCORE=35
+Optional ENV (recommended defaults):
+  MIN_SCORE=30
   POLL_SECONDS=300
-  MAX_ALERTS_PER_CYCLE=4
-  COOLDOWN_MINUTES=90
-  MIN_LIQ=0
-  MIN_VOL24H=0
-  SPREAD_MAX=0.08
-  EDGE_MIN=0.012
-  MOMENTUM_MIN=0.006
-  MOVE_VOL_MIN=2500
+  MAX_ALERTS_PER_CYCLE=6
+  COOLDOWN_MINUTES=45
 
-Data source (choose one):
-  1) POLY_ENDPOINT -> URL returning a JSON list of markets (your existing endpoint)
-     Each market item ideally contains:
-       id, slug or url, question/title, outcomes/prices, volume, liquidity, volume24h, lastPrice/price history, etc.
-  If your previous bot already had a working fetcher, paste your endpoint here (recommended).
+Microstructure controls:
+  SPREAD_SOFT_MAX=0.12     # penalize above this (but don't hard-block)
+  SPREAD_HARD_MAX=0.22     # hard block only if super bad
+  MOVE_VOL_MIN=800         # aggressive: low threshold
+  MOMENTUM_MIN=0.003       # aggressive: 0.3% prob move
 """
 
 import os
@@ -35,7 +31,7 @@ import time
 import json
 import math
 import hashlib
-from datetime import datetime, timezone, timedelta
+from typing import Optional, Tuple
 
 import requests
 
@@ -44,33 +40,29 @@ import requests
 # ==========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+POLY_ENDPOINT = os.getenv("POLY_ENDPOINT", "").strip()
 
-POLY_ENDPOINT = os.getenv("POLY_ENDPOINT", "").strip()  # your JSON endpoint
-MIN_SCORE = float(os.getenv("MIN_SCORE", "35"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "30"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "300"))  # 5 min
-MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "4"))
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "90"))
+MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "6"))
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "45"))
 
-# light “sanity” filters (kept flexible by default)
-MIN_LIQ = float(os.getenv("MIN_LIQ", "0"))
-MIN_VOL24H = float(os.getenv("MIN_VOL24H", "0"))
+# "keep aggressive"
+MOVE_VOL_MIN = float(os.getenv("MOVE_VOL_MIN", "800"))
+MOMENTUM_MIN = float(os.getenv("MOMENTUM_MIN", "0.003"))
 
-# microstructure / entry quality
-SPREAD_MAX = float(os.getenv("SPREAD_MAX", "0.08"))     # 8% max implied spread (avoid huge trap)
-EDGE_MIN = float(os.getenv("EDGE_MIN", "0.012"))        # min edge vs mid ~ 1.2%
-MOMENTUM_MIN = float(os.getenv("MOMENTUM_MIN", "0.006"))# price move threshold ~ 0.6%
-MOVE_VOL_MIN = float(os.getenv("MOVE_VOL_MIN", "2500")) # volume delta threshold
+# spread controls: soft penalty + hard block only when insane
+SPREAD_SOFT_MAX = float(os.getenv("SPREAD_SOFT_MAX", "0.12"))
+SPREAD_HARD_MAX = float(os.getenv("SPREAD_HARD_MAX", "0.22"))
 
-# always only BUY alerts
-ONLY_BUY = True
+STATE_FILE = "state.json"
 
 # ==========================
 # TELEGRAM
 # ==========================
 def tg_send(text: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID.")
-        print(text)
+        print("⚠️ Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID.\n", text)
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -91,43 +83,36 @@ def tg_send(text: str) -> None:
 # FETCH MARKETS
 # ==========================
 def fetch_markets() -> list[dict]:
-    """
-    Expect POLY_ENDPOINT to return a JSON list of markets.
-    If your endpoint returns {"markets":[...]}, we handle that too.
-    """
     if not POLY_ENDPOINT:
-        raise RuntimeError("POLY_ENDPOINT not set. Provide your working JSON endpoint used before.")
-
+        raise RuntimeError("POLY_ENDPOINT not set. Set it to your working JSON endpoint.")
     r = requests.get(POLY_ENDPOINT, timeout=30)
     r.raise_for_status()
     data = r.json()
-
-    if isinstance(data, dict) and "markets" in data and isinstance(data["markets"], list):
+    if isinstance(data, dict) and isinstance(data.get("markets"), list):
         return data["markets"]
     if isinstance(data, list):
         return data
-    raise RuntimeError("Unexpected POLY_ENDPOINT response format (expected list or {'markets': [...]})")
+    raise RuntimeError("Unexpected POLY_ENDPOINT response. Expected list or {'markets':[...]}")
 
 # ==========================
-# HELPERS: MARKET NORMALIZATION
+# HELPERS
 # ==========================
-def _get(m: dict, *keys, default=None):
+def _get(d: dict, *keys, default=None):
     for k in keys:
-        if k in m and m[k] is not None:
-            return m[k]
+        if k in d and d[k] is not None:
+            return d[k]
     return default
 
 def market_url(m: dict) -> str:
-    return _get(m, "url", "marketUrl", "link", default="").strip()
+    return str(_get(m, "url", "marketUrl", "link", default="")).strip()
 
 def market_title(m: dict) -> str:
-    return _get(m, "question", "title", "name", default="(untitled)").strip()
+    return str(_get(m, "question", "title", "name", default="(untitled)")).strip()
 
 def market_id(m: dict) -> str:
-    mid = _get(m, "id", "marketId", "slug", default="")
-    if mid:
+    mid = _get(m, "id", "marketId", "slug", default=None)
+    if mid is not None and str(mid).strip():
         return str(mid)
-    # fallback stable hash
     base = (market_url(m) or market_title(m)).encode("utf-8", "ignore")
     return hashlib.sha1(base).hexdigest()[:12]
 
@@ -140,14 +125,7 @@ def get_vol24h(m: dict) -> float:
 def get_volume(m: dict) -> float:
     return float(_get(m, "volume", "vol", "volumeUSD", default=0) or 0)
 
-def get_last_price_yes(m: dict) -> float | None:
-    """
-    Tries to locate a YES probability/price in [0,1].
-    Supports a few common formats:
-      - m["yes"] or m["yesPrice"]
-      - m["outcomes"] = [{"name":"Yes","price":0.42}, ...]
-      - m["prices"] = {"YES":0.42,"NO":0.58}
-    """
+def get_last_price_yes(m: dict) -> Optional[float]:
     direct = _get(m, "yes", "yesPrice", "p_yes", default=None)
     if direct is not None:
         try:
@@ -167,32 +145,25 @@ def get_last_price_yes(m: dict) -> float | None:
                 except:
                     return None
 
-    prices = _get(m, "prices", "price", default=None)
+    prices = _get(m, "prices", default=None)
     if isinstance(prices, dict):
-        for k in prices.keys():
+        for k, v in prices.items():
             if str(k).lower() == "yes":
                 try:
-                    p = float(prices[k])
+                    p = float(v)
                     return p if 0 <= p <= 1 else None
                 except:
                     return None
 
     return None
 
-def get_best_bid_ask_yes(m: dict) -> tuple[float | None, float | None]:
-    """
-    Tries to read bid/ask for YES if present.
-    Common shapes:
-      - m["orderbook"]["yes"]["bid"], ["ask"]
-      - m["bestBidYes"], m["bestAskYes"]
-    """
+def get_best_bid_ask_yes(m: dict) -> Tuple[Optional[float], Optional[float]]:
     bid = _get(m, "bestBidYes", "bidYes", default=None)
     ask = _get(m, "bestAskYes", "askYes", default=None)
     if bid is not None or ask is not None:
         try:
-            bid = float(bid) if bid is not None else None
-            ask = float(ask) if ask is not None else None
-            return bid, ask
+            return (float(bid) if bid is not None else None,
+                    float(ask) if ask is not None else None)
         except:
             return None, None
 
@@ -207,142 +178,22 @@ def get_best_bid_ask_yes(m: dict) -> tuple[float | None, float | None]:
             try:
                 bid = yes_ob.get("bid") or yes_ob.get("bestBid")
                 ask = yes_ob.get("ask") or yes_ob.get("bestAsk")
-                bid = float(bid) if bid is not None else None
-                ask = float(ask) if ask is not None else None
-                return bid, ask
+                return (float(bid) if bid is not None else None,
+                        float(ask) if ask is not None else None)
             except:
                 return None, None
 
     return None, None
 
-# ==========================
-# SCORING (only for BUY entries)
-# ==========================
 def clamp(x: float, a: float, b: float) -> float:
     return max(a, min(b, x))
 
-def score_market(m: dict, prev: dict | None) -> tuple[float, dict]:
-    """
-    Returns (score, details) for BUY opportunities.
-    The score emphasizes:
-      - edge vs mid (if bid/ask exist) or vs last price proxy
-      - momentum / move
-      - liquidity + volume changes
-      - penalize large spreads (spread trap)
-    """
-    liq = get_liq(m)
-    vol = get_volume(m)
-    vol24 = get_vol24h(m)
-    p_yes = get_last_price_yes(m)
-
-    bid, ask = get_best_bid_ask_yes(m)
-    if bid is not None and ask is not None and ask > 0:
-        mid = (bid + ask) / 2.0
-        spread = (ask - bid) / max(mid, 1e-9)
-    else:
-        mid = p_yes if p_yes is not None else None
-        spread = None
-
-    # deltas
-    prev_vol = float(prev.get("volume", 0)) if prev else 0.0
-    prev_p = float(prev.get("p_yes", p_yes if p_yes is not None else 0.0)) if prev else (p_yes or 0.0)
-
-    vol_delta = max(0.0, vol - prev_vol)
-    price_move = abs((p_yes or 0.0) - prev_p)
-
-    # entry direction (BUY) logic:
-    # We consider BUY when either:
-    #  - bid/ask present and "edge" positive (bid below mid by some margin) i.e. you can buy near bid/ask cheaply
-    #  - or momentum is positive (p_yes rising) and move/volume confirm
-    #
-    # Since Polymarket is binary, “BUY” here means "enter the favored side now" (we’ll specify YES/NO).
-    # Determine suggested side by where probability is moving:
-    suggested = None  # "YES" or "NO"
-    if p_yes is not None:
-        # if p_yes increasing -> YES momentum, else NO momentum
-        suggested = "YES" if (p_yes - prev_p) >= 0 else "NO"
-
-    # edge proxy:
-    # If orderbook exists, reward tighter spread and ability to buy near bid/ask.
-    edge = 0.0
-    spread_penalty = 0.0
-    if bid is not None and ask is not None and mid is not None:
-        # "cheapness": if mid is low for suggested side, that can be "value",
-        # but we mainly use spread + mid distance to avoid traps.
-        # We'll approximate edge as tightness + move+vol confirmation.
-        edge = max(0.0, (SPREAD_MAX - spread)) if spread is not None else 0.0
-        if spread is not None and spread > SPREAD_MAX:
-            spread_penalty = (spread - SPREAD_MAX) * 30.0  # big penalty
-    else:
-        # no orderbook -> edge from momentum + vol_delta only
-        edge = 0.0
-
-    # components normalized (0..1-ish)
-    liq_s = clamp(math.log10(liq + 1) / 6.0, 0, 1)          # 1 around ~1M
-    vol24_s = clamp(math.log10(vol24 + 1) / 6.0, 0, 1)
-    vdelta_s = clamp(math.log10(vol_delta + 1) / 5.0, 0, 1) # 1 around ~100k
-    move_s = clamp(price_move / 0.05, 0, 1)                 # 5% prob move hits 1
-    edge_s = clamp(edge / SPREAD_MAX, 0, 1) if SPREAD_MAX > 0 else 0.0
-
-    # base score (0..100 approx)
-    score = 100.0 * (
-        0.28 * vdelta_s +
-        0.22 * move_s +
-        0.18 * liq_s +
-        0.12 * vol24_s +
-        0.20 * edge_s
-    ) - spread_penalty
-
-    # enforce minimum “actionability”
-    action_ok = True
-    reasons = []
-    if liq < MIN_LIQ:
-        action_ok = False
-        reasons.append(f"liq<{MIN_LIQ:g}")
-    if vol24 < MIN_VOL24H:
-        action_ok = False
-        reasons.append(f"vol24h<{MIN_VOL24H:g}")
-    if vol_delta < MOVE_VOL_MIN and price_move < MOMENTUM_MIN:
-        action_ok = False
-        reasons.append("weak move/flow")
-    if spread is not None and spread > SPREAD_MAX:
-        action_ok = False
-        reasons.append("spread trap")
-    # edge min if spread exists
-    if spread is not None and (SPREAD_MAX - spread) < EDGE_MIN:
-        action_ok = False
-        reasons.append("low edge")
-
-    details = {
-        "liq": liq,
-        "vol": vol,
-        "vol24h": vol24,
-        "vol_delta": vol_delta,
-        "p_yes": p_yes,
-        "prev_p": prev_p,
-        "price_move": price_move,
-        "bid": bid,
-        "ask": ask,
-        "spread": spread,
-        "suggested": suggested,
-        "action_ok": action_ok,
-        "blocks": reasons,
-        "url": market_url(m),
-        "title": market_title(m),
-        "id": market_id(m),
-    }
-
-    if not action_ok:
-        # do not send at all if not actionable; score becomes 0 for filtering
-        return 0.0, details
-
-    return max(0.0, score), details
+def now_ts() -> int:
+    return int(time.time())
 
 # ==========================
-# STATE (cooldowns)
+# STATE
 # ==========================
-STATE_FILE = "state.json"
-
 def load_state() -> dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -357,23 +208,17 @@ def save_state(st: dict) -> None:
     except Exception as e:
         print("state save error:", repr(e))
 
-def now_ts() -> int:
-    return int(time.time())
-
 def can_alert(st: dict, mid: str, score: float) -> bool:
-    """
-    Cooldown per market; only alert again after COOLDOWN_MINUTES
-    or if score jumps materially.
-    """
     seen = st.get("seen", {}).get(mid)
     if not seen:
         return True
     last_ts = int(seen.get("ts", 0))
     last_score = float(seen.get("score", 0))
+    # cooldown
     if now_ts() - last_ts >= COOLDOWN_MINUTES * 60:
         return True
-    # if score improves a lot, allow earlier alert
-    if score >= last_score + 12:
+    # allow if score improves materially (keeps it aggressive)
+    if score >= last_score + 7:
         return True
     return False
 
@@ -381,9 +226,95 @@ def mark_alerted(st: dict, mid: str, score: float) -> None:
     st.setdefault("seen", {})[mid] = {"ts": now_ts(), "score": round(score, 2)}
 
 # ==========================
-# MESSAGE FORMAT (BUY ONLY)
+# SCORING (AGGRESSIVE, BUY-ONLY)
 # ==========================
-def fmt_pct(x: float | None) -> str:
+def score_market(m: dict, prev: Optional[dict]) -> tuple[float, dict]:
+    liq = get_liq(m)
+    vol = get_volume(m)
+    vol24 = get_vol24h(m)
+
+    p_yes = get_last_price_yes(m)
+    bid, ask = get_best_bid_ask_yes(m)
+
+    # snapshot deltas
+    prev_vol = float(prev.get("volume", 0.0)) if prev else 0.0
+    prev_p = float(prev.get("p_yes", p_yes if p_yes is not None else 0.0)) if prev else (p_yes or 0.0)
+
+    vol_delta = max(0.0, vol - prev_vol)
+    p_now = p_yes if p_yes is not None else prev_p
+    dp = p_now - prev_p
+    price_move = abs(dp)
+
+    # decide BUY side (explicit)
+    # if probability rising -> BUY YES; falling -> BUY NO
+    suggested = "YES" if dp >= 0 else "NO"
+
+    # spread metrics
+    spread = None
+    if bid is not None and ask is not None and bid >= 0 and ask > 0:
+        mid = (bid + ask) / 2.0
+        spread = (ask - bid) / max(mid, 1e-9)
+
+    # HARD block only if spread is crazy (prevents the “cashout low price” trap)
+    if spread is not None and spread > SPREAD_HARD_MAX:
+        return 0.0, {
+            "blocked": True,
+            "block_reason": f"spread>{SPREAD_HARD_MAX:.2f}",
+            "suggested": suggested,
+            "liq": liq, "vol": vol, "vol24h": vol24,
+            "vol_delta": vol_delta,
+            "p_yes": p_yes, "prev_p": prev_p, "price_move": price_move,
+            "bid": bid, "ask": ask, "spread": spread,
+            "url": market_url(m), "title": market_title(m), "id": market_id(m),
+        }
+
+    # normalize components (aggressive weights)
+    liq_s = clamp(math.log10(liq + 1) / 6.0, 0, 1)          # saturates near 1M
+    vdelta_s = clamp(math.log10(vol_delta + 1) / 4.5, 0, 1) # saturates earlier (aggressive)
+    move_s = clamp(price_move / 0.04, 0, 1)                 # 4% move saturates
+
+    # spread penalty (soft)
+    spread_pen = 0.0
+    if spread is not None and spread > SPREAD_SOFT_MAX:
+        spread_pen = (spread - SPREAD_SOFT_MAX) * 80.0  # moderate penalty
+
+    # entry “trigger” (keep aggressive)
+    trigger_ok = (vol_delta >= MOVE_VOL_MIN) or (price_move >= MOMENTUM_MIN)
+
+    if not trigger_ok:
+        # don't hard-block by score math (still keep it aggressive), just low score
+        base = 100.0 * (0.45 * vdelta_s + 0.35 * move_s + 0.20 * liq_s) - spread_pen
+        score = max(0.0, base * 0.55)
+    else:
+        base = 100.0 * (0.45 * vdelta_s + 0.35 * move_s + 0.20 * liq_s) - spread_pen
+        score = max(0.0, base)
+
+    details = {
+        "blocked": False,
+        "suggested": suggested,
+        "liq": liq,
+        "vol": vol,
+        "vol24h": vol24,
+        "vol_delta": vol_delta,
+        "p_yes": p_yes,
+        "prev_p": prev_p,
+        "dp": dp,
+        "price_move": price_move,
+        "bid": bid,
+        "ask": ask,
+        "spread": spread,
+        "url": market_url(m),
+        "title": market_title(m),
+        "id": market_id(m),
+        "trigger_ok": trigger_ok,
+        "spread_pen": spread_pen,
+    }
+    return score, details
+
+# ==========================
+# MESSAGE (BUY ONLY)
+# ==========================
+def fmt_pct(x: Optional[float]) -> str:
     if x is None:
         return "-"
     return f"{x*100:.2f}%"
@@ -391,91 +322,90 @@ def fmt_pct(x: float | None) -> str:
 def format_buy_alert(score: float, d: dict) -> str:
     title = d["title"]
     url = d["url"] or ""
-    suggested = d.get("suggested") or "YES"
+    suggested = d.get("suggested", "YES")
 
-    # Make it explicit: BUY YES / BUY NO
+    # clarify action:
     action_line = f"🟢 <b>BUY {suggested}</b> (entry)"
-    # numeric context
-    vol_delta = d["vol_delta"]
-    liq = d["liq"]
-    p_yes = d["p_yes"]
-    prev_p = d["prev_p"]
-    pmove = d["price_move"]
+
+    p_yes = d.get("p_yes")
+    prev_p = d.get("prev_p", 0.0)
+    dp = d.get("dp", 0.0)
+    vol_delta = d.get("vol_delta", 0.0)
+    liq = d.get("liq", 0.0)
 
     bid = d.get("bid")
     ask = d.get("ask")
     spread = d.get("spread")
 
-    parts = []
-    parts.append(f"🚨 <b>OPPORTUNITY</b> | Score: <b>{score:.1f}</b>")
-    parts.append(action_line)
-    parts.append(f"📝 <b>{title}</b>")
+    reasons = []
+    if d.get("trigger_ok"):
+        reasons.append("move/flow ok")
+    else:
+        reasons.append("flow building")
+    if spread is None:
+        reasons.append("no book data")
+    else:
+        reasons.append(f"spread {fmt_pct(spread)}")
+
+    msg = []
+    msg.append(f"🚨 <b>BUY ALERT</b> | Score: <b>{score:.1f}</b>")
+    msg.append(action_line)
+    msg.append(f"📝 <b>{title}</b>")
     if p_yes is not None:
-        parts.append(f"📌 YES: <b>{p_yes:.3f}</b> (prev {prev_p:.3f}) | Move: <b>{pmove*100:.2f}%</b>")
+        msg.append(f"📌 YES: <b>{p_yes:.3f}</b> (prev {prev_p:.3f}, Δ {dp:+.3f})")
     if bid is not None and ask is not None:
-        parts.append(f"📚 Book YES | bid {bid:.3f} / ask {ask:.3f} | spread {fmt_pct(spread)}")
-    parts.append(f"💧 Liq: <b>{liq:,.0f}</b> | VolΔ: <b>{vol_delta:,.0f}</b>")
-    parts.append(f"🔎 Reason: move+flow confirmed, spread ok, actionable entry")
+        msg.append(f"📚 Book YES | bid {bid:.3f} / ask {ask:.3f} | spread {fmt_pct(spread)}")
+    msg.append(f"💧 Liq: <b>{liq:,.0f}</b> | VolΔ: <b>{vol_delta:,.0f}</b>")
+    msg.append(f"🧠 Reason: {', '.join(reasons)}")
     if url:
-        parts.append(url)
-    return "\n".join(parts)
+        msg.append(url)
+    return "\n".join(msg)
 
 # ==========================
 # MAIN LOOP
 # ==========================
 def main():
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID.")
     st = load_state()
-    snap = st.get("snap", {})  # store minimal previous snapshot per market
+    snap = st.get("snap", {})
 
     print("BOOT_OK: main.py running")
-    print(f"Config: MIN_SCORE={MIN_SCORE} POLL_SECONDS={POLL_SECONDS} ONLY_BUY={ONLY_BUY}")
+    print(f"Config: MIN_SCORE={MIN_SCORE} POLL_SECONDS={POLL_SECONDS} MAX_ALERTS_PER_CYCLE={MAX_ALERTS_PER_CYCLE}")
 
     while True:
         try:
             markets = fetch_markets()
+            scored: list[tuple[float, dict]] = []
 
-            scored = []
             for m in markets:
                 mid = market_id(m)
+                prev = snap.get(mid)
 
-                prev = snap.get(mid, None)
-                score, details = score_market(m, prev)
+                score, d = score_market(m, prev)
 
-                # update snapshot regardless
+                # update snapshot (minimal)
                 snap[mid] = {
                     "volume": get_volume(m),
-                    "p_yes": get_last_price_yes(m) or (prev.get("p_yes") if prev else 0.0),
+                    "p_yes": get_last_price_yes(m) if get_last_price_yes(m) is not None else (prev.get("p_yes") if prev else 0.0),
                     "ts": now_ts(),
                 }
 
-                # Filter: BUY only + MIN_SCORE
-                if score >= MIN_SCORE:
-                    if ONLY_BUY:
-                        # we already only produce actionable BUY; but keep check:
-                        if details.get("action_ok"):
-                            scored.append((score, details))
+                # BUY-only + threshold
+                if score >= MIN_SCORE and not d.get("blocked", False):
+                    scored.append((score, d))
 
-            # sort by best score
             scored.sort(key=lambda x: x[0], reverse=True)
 
-            alerts_sent = 0
+            sent = 0
             for score, d in scored:
-                if alerts_sent >= MAX_ALERTS_PER_CYCLE:
+                if sent >= MAX_ALERTS_PER_CYCLE:
                     break
-
                 mid = d["id"]
                 if not can_alert(st, mid, score):
                     continue
-
-                msg = format_buy_alert(score, d)
-                tg_send(msg)
-
+                tg_send(format_buy_alert(score, d))
                 mark_alerted(st, mid, score)
-                alerts_sent += 1
+                sent += 1
 
-            # persist state
             st["snap"] = snap
             save_state(st)
 
