@@ -9,26 +9,37 @@ import requests
 from datetime import datetime, timezone
 
 # =========================
-# CONFIG
+# ENV / CONFIG
 # =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 GAMMA_URL = os.getenv("GAMMA_URL", "https://gamma-api.polymarket.com").rstrip("/")
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))                  # 1 min
-MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "60"))  # agressivo
-REPEAT_COOLDOWN_SEC = int(os.getenv("REPEAT_COOLDOWN_SEC", "30"))    # repetir rápido
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
+MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "50"))
+REPEAT_COOLDOWN_SEC = int(os.getenv("REPEAT_COOLDOWN_SEC", "30"))
 
 PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "250"))
-MAX_PAGES = int(os.getenv("MAX_PAGES", "6"))  # 6*250=1500 mercados
+MAX_PAGES = int(os.getenv("MAX_PAGES", "6"))  # ~1500
 
-SCORE_MIN = float(os.getenv("SCORE_MIN", "0"))  # 0 = não filtra; 30 = só >=30
+DEBUG_EVERY_SEC = int(os.getenv("DEBUG_EVERY_SEC", "180"))
 
-REPLAY_ON_BOOT = os.getenv("REPLAY_ON_BOOT", "0").strip() == "1"
-REPLAY_LIMIT = int(os.getenv("REPLAY_LIMIT", "20"))
+# ---- Strategy knobs ----
+# Arbitrage: requires (1 - (yes+no) - FEE_BUFFER) >= ARB_GAP_MIN
+ARB_GAP_MIN = float(os.getenv("ARB_GAP_MIN", "0.007"))      # 0.7%
+FEE_BUFFER  = float(os.getenv("FEE_BUFFER",  "0.003"))      # 0.3% (fees/slippage cushion)
 
-HISTORY_PATH = os.getenv("HISTORY_PATH", "sent_history.jsonl")  # json lines
-DEBUG_EVERY_SEC = int(os.getenv("DEBUG_EVERY_SEC", "180"))       # 3 min
+# Cheap quotes thresholds
+CHEAP_MAX_PRICE = float(os.getenv("CHEAP_MAX_PRICE", "0.10"))  # <= 0.10 is "cheap"
+CHEAP_MID_BONUS = float(os.getenv("CHEAP_MID_BONUS", "0.02"))  # bonus if also near mid
+
+# Spread trap / data sanity (proxy)
+# sum_err = abs((yes+no) - 1.0). High => stale/odd data => penalize or skip
+SUM_ERR_SKIP = float(os.getenv("SUM_ERR_SKIP", "0.12"))     # if > 0.12 skip unless arb is strong
+SUM_ERR_PEN_W = float(os.getenv("SUM_ERR_PEN_W", "60"))     # penalty weight
+
+# Optional score filter (0 = no filter)
+SCORE_MIN = float(os.getenv("SCORE_MIN", "0"))              # set 30 if you want
 
 # =========================
 # HELPERS
@@ -69,11 +80,10 @@ def tg_send(text: str) -> bool:
     }
 
     status, body = tg_api("sendMessage", payload)
-
     if status == 200:
         return True
 
-    # rate limit (429)
+    # Telegram rate limit
     if status == 429:
         retry_after = 2
         try:
@@ -120,8 +130,24 @@ def market_url(market: dict):
         return f"https://polymarket.com/market/{mid}"
     return "https://polymarket.com"
 
+def get_liq_vol(market: dict):
+    liq = safe_float(
+        market.get("liquidity")
+        or market.get("liquidityNum")
+        or market.get("liquidity_num"),
+        0.0
+    ) or 0.0
+    vol24 = safe_float(
+        market.get("volume24hr")
+        or market.get("volume24h")
+        or market.get("volumeNum")
+        or market.get("volume_num"),
+        0.0
+    ) or 0.0
+    return liq, vol24
+
 # =========================
-# FETCH MARKETS (PAGINADO)
+# FETCH MARKETS (PAGINATED)
 # =========================
 def fetch_markets_paged():
     all_markets = []
@@ -170,15 +196,9 @@ def fetch_markets_paged():
     return all_markets, last_err, used
 
 # =========================
-# PARSE YES/NO (CORRIGIDO)
+# PARSE YES/NO (robust)
 # =========================
 def parse_outcome_prices(value):
-    """
-    value pode ser:
-    - list: ["0.2","0.8"] ou [0.2, 0.8]
-    - string JSON: "[\"0.2\",\"0.8\"]"
-    - string CSV: "0.2,0.8"
-    """
     if value is None:
         return None
     if isinstance(value, list):
@@ -213,7 +233,7 @@ def parse_yes_no(market: dict):
             yes = safe_float(toks[0].get("price"), yes)
             no  = safe_float(toks[1].get("price"), no)
 
-    # lastPrice fallback
+    # last price fallback
     if yes is None:
         lp = market.get("lastTradePrice") or market.get("lastPrice") or market.get("last_price")
         yes = safe_float(lp, None)
@@ -227,159 +247,67 @@ def parse_yes_no(market: dict):
     return yes, no
 
 # =========================
-# BUY LOGIC + SCORE
+# SIGNALS: arbitrage / cheap / spread
 # =========================
-def decide_buy(yes: float, no: float):
-    # BUY-only: escolhe um lado sempre
-    if yes < 0.5:
-        return "BUY_YES"
-    if yes > 0.5:
-        return "BUY_NO"
-    return "BUY_YES" if yes <= no else "BUY_NO"
+def arb_gap(yes: float, no: float) -> float:
+    # Positive means YES+NO < 1 (discount)
+    return 1.0 - (yes + no)
 
-def compute_score(yes: float, liq: float, vol24: float, sum_err: float):
+def mid_pref(yes: float) -> float:
+    # 1 at 0.5, 0 at 0 or 1
+    return clamp(1.0 - abs(yes - 0.5) * 2.0, 0.0, 1.0)
+
+def cheap_side(yes: float, no: float):
+    # Returns ("BUY_YES"/"BUY_NO", cheapness_value) or (None, 0)
+    # cheapness_value bigger when price smaller
+    if yes <= CHEAP_MAX_PRICE:
+        return "BUY_YES", (CHEAP_MAX_PRICE - yes) / max(CHEAP_MAX_PRICE, 1e-9)
+    if no <= CHEAP_MAX_PRICE:
+        return "BUY_NO", (CHEAP_MAX_PRICE - no) / max(CHEAP_MAX_PRICE, 1e-9)
+    return None, 0.0
+
+def score_combo(yes: float, no: float, liq: float, vol24: float, net_gap: float, cheapness: float, sum_err: float) -> float:
     """
-    Score 0-100 estável:
-    - favorece mercados com liquidez e volume
-    - favorece preços perto de 0.5 (mais tradeável)
-    - penaliza dados estranhos (yes+no muito fora de 1)
+    Score 0-100:
+    - Arbitrage net gap drives score most (up to 55)
+    - Cheapness drives (up to 25)
+    - Liquidity/Volume drive (up to 20)
+    - Penalize spread proxy/sanity issues (sum_err)
     """
-    mid_pref = 1.0 - abs(yes - 0.5) * 2.0
-    mid_pref = clamp(mid_pref, 0.0, 1.0)
+    # normalize net_gap: 0% -> 0, 5% -> 1
+    gap_n = clamp(net_gap / 0.05, 0.0, 1.0)
 
-    liq_n = clamp(math.log10(liq + 1.0) / 5.0, 0.0, 1.0)     # 1e5 ~ 1
-    vol_n = clamp(math.log10(vol24 + 1.0) / 6.0, 0.0, 1.0)   # 1e6 ~ 1
+    liq_n = clamp(math.log10(liq + 1.0) / 5.0, 0.0, 1.0)
+    vol_n = clamp(math.log10(vol24 + 1.0) / 6.0, 0.0, 1.0)
 
-    err_pen = clamp(sum_err * 10.0, 0.0, 0.7)
+    base = (55.0 * gap_n) + (25.0 * clamp(cheapness, 0.0, 1.0)) + (12.0 * liq_n) + (8.0 * vol_n)
 
-    score = (40.0 * mid_pref) + (35.0 * liq_n) + (25.0 * vol_n) - (35.0 * err_pen)
-    return round(clamp(score, 0.0, 100.0), 1)
+    # extra small bonus if near mid (tradeable)
+    base += CHEAP_MID_BONUS * 100.0 * mid_pref(yes)
 
-def get_liq_vol(market: dict):
-    liq = safe_float(
-        market.get("liquidity")
-        or market.get("liquidityNum")
-        or market.get("liquidity_num"),
-        0.0
-    ) or 0.0
-    vol24 = safe_float(
-        market.get("volume24hr")
-        or market.get("volume24h")
-        or market.get("volumeNum")
-        or market.get("volume_num"),
-        0.0
-    ) or 0.0
-    return liq, vol24
+    # penalty for “spread proxy” / odd data
+    pen = min(SUM_ERR_PEN_W * sum_err, 45.0)
 
-def format_buy(market: dict, rec: str, yes: float, no: float, score: float, tag: str = "BUY ALERT"):
+    return round(clamp(base - pen, 0.0, 100.0), 1)
+
+# =========================
+# OUTPUT FORMAT
+# =========================
+def format_alert(market: dict, kind: str, score: float, yes: float, no: float, liq: float, vol24: float, details: str):
     title = (market.get("question") or market.get("title") or "Market").strip()
-    liq, vol24 = get_liq_vol(market)
     url = market_url(market)
-
-    if rec == "BUY_YES":
-        action = "🟢 COMPRA: YES (a favor)"
-        alvo = yes
-    else:
-        action = "🔴 COMPRA: NO (contra)"
-        alvo = no
-
     return (
-        f"🚨 {tag} | Score {score}\n"
-        f"{action}\n"
+        f"🚨 {kind} | Score {score}\n"
         f"🧠 {title}\n"
-        f"💰 YES {yes:.3f} | NO {no:.3f} | alvo {alvo:.3f}\n"
+        f"💰 YES {yes:.3f} | NO {no:.3f}\n"
         f"📊 Liq {int(liq)} | Vol24h {int(vol24)}\n"
+        f"📝 {details}\n"
         f"🔗 {url}\n"
         f"🕒 {now_utc()}"
     )
 
 # =========================
-# HISTORY (persistente)
-# =========================
-def append_history(item: dict):
-    try:
-        with open(HISTORY_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print("history append failed:", repr(e))
-
-def load_history_last(n: int):
-    """
-    Lê os últimos n itens do arquivo jsonl.
-    Sem dependências; eficiente o suficiente para n pequeno.
-    """
-    if n <= 0:
-        return []
-    if not os.path.exists(HISTORY_PATH):
-        return []
-    try:
-        with open(HISTORY_PATH, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        lines = lines[-n:]
-        out = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except Exception:
-                continue
-        return out
-    except Exception as e:
-        print("history load failed:", repr(e))
-        return []
-
-def replay_last_alerts():
-    items = load_history_last(REPLAY_LIMIT)
-    if not items:
-        tg_send(f"🔁 REPLAY: sem histórico disponível (arquivo vazio). Hora {now_utc()}")
-        return
-
-    tg_send(f"🔁 REPLAY MODE: repetindo últimos {len(items)} alertas com SCORE. Hora {now_utc()}")
-
-    sent = 0
-    for it in items:
-        try:
-            title = it.get("title") or "Market"
-            url = it.get("url") or "https://polymarket.com"
-            rec = it.get("rec") or "BUY_YES"
-            yes = safe_float(it.get("yes"), None)
-            no  = safe_float(it.get("no"), None)
-            liq = safe_float(it.get("liq"), 0.0) or 0.0
-            vol24 = safe_float(it.get("vol24"), 0.0) or 0.0
-
-            if yes is None or no is None:
-                continue
-
-            sum_err = abs((yes + no) - 1.0)
-            score = compute_score(yes, liq, vol24, sum_err)
-
-            if score < SCORE_MIN:
-                continue
-
-            action = "🟢 COMPRA: YES (a favor)" if rec == "BUY_YES" else "🔴 COMPRA: NO (contra)"
-            alvo = yes if rec == "BUY_YES" else no
-
-            msg = (
-                f"🚨 REPLAY BUY | Score {score}\n"
-                f"{action}\n"
-                f"🧠 {title}\n"
-                f"💰 YES {yes:.3f} | NO {no:.3f} | alvo {alvo:.3f}\n"
-                f"📊 Liq {int(liq)} | Vol24h {int(vol24)}\n"
-                f"🔗 {url}\n"
-                f"🕒 {now_utc()}"
-            )
-            if tg_send(msg):
-                sent += 1
-            time.sleep(0.8)  # evita 429
-        except Exception:
-            continue
-
-    tg_send(f"✅ REPLAY concluído. enviados={sent}. Hora {now_utc()}")
-
-# =========================
-# DEDUPE (repetição controlada)
+# DEDUPE
 # =========================
 last_sent = {}
 
@@ -393,33 +321,26 @@ def should_send(key: str):
         return True
     return False
 
-def make_key(market: dict, rec: str, yes: float, no: float):
+def make_key(market: dict, kind: str, yes: float, no: float):
     mid = market.get("id") or market.get("conditionId") or market.get("slug") or (market.get("question") or "m")
-    price = yes if rec == "BUY_YES" else no
-    bucket = round(price, 3)
-    return f"{mid}:{rec}:{bucket}"
+    return f"{mid}:{kind}:{round(yes,3)}:{round(no,3)}"
 
 # =========================
 # MAIN
 # =========================
-def boot_tests():
+def boot():
     print("BOOT_OK: main.py running")
-    # confirma telegram rapidamente
     st, body = tg_api("getMe", {})
     if st != 200:
         print("❌ Telegram getMe failed:", st, body[:300])
-    else:
-        tg_send(
-            f"✅ Bot ON | BUY-only | score+replay | poll={POLL_SECONDS}s | pages={MAX_PAGES}x{PAGE_LIMIT} | "
-            f"max/cycle={MAX_ALERTS_PER_CYCLE} | cooldown={REPEAT_COOLDOWN_SEC}s | score_min={SCORE_MIN}"
-        )
+    tg_send(
+        "✅ Bot ON | BUY-only | arbitrage+spread+cheap+score\n"
+        f"gap_min={ARB_GAP_MIN*100:.2f}% | buffer={FEE_BUFFER*100:.2f}% | cheap≤{CHEAP_MAX_PRICE:.2f}\n"
+        f"poll={POLL_SECONDS}s | pages={MAX_PAGES}x{PAGE_LIMIT} | max/cycle={MAX_ALERTS_PER_CYCLE} | score_min={SCORE_MIN}"
+    )
 
 def main():
-    boot_tests()
-
-    if REPLAY_ON_BOOT:
-        replay_last_alerts()
-
+    boot()
     last_debug = 0
 
     while True:
@@ -439,48 +360,68 @@ def main():
             parse_ok += 1
 
             liq, vol24 = get_liq_vol(m)
-            sum_err = abs((yes + no) - 1.0)
-            score = compute_score(yes, liq, vol24, sum_err)
+            sum_err = abs((yes + no) - 1.0)  # spread proxy / sanity
+            gap = arb_gap(yes, no)
+            net_gap = gap - FEE_BUFFER
 
-            if score < SCORE_MIN:
+            # If data looks weird, skip unless arbitrage is really strong
+            if sum_err > SUM_ERR_SKIP and net_gap < (ARB_GAP_MIN * 2):
                 continue
 
-            rec = decide_buy(yes, no)
-            key = make_key(m, rec, yes, no)
+            # 1) Arbitrage opportunity (buy both)
+            if net_gap >= ARB_GAP_MIN:
+                # cheapness can also contribute if one side is very low
+                _, cheapness = cheap_side(yes, no)
+                score = score_combo(yes, no, liq, vol24, net_gap, cheapness, sum_err)
 
-            if should_send(key):
-                candidates.append((score, m, rec, yes, no, liq, vol24))
+                if score >= SCORE_MIN:
+                    kind = "ARBITRAGEM (BUY YES + BUY NO)"
+                    details = (
+                        f"AÇÃO: comprar os dois lados. "
+                        f"YES+NO={yes+no:.3f} | ArbGap bruto={gap*100:.2f}% | líquido≈{net_gap*100:.2f}% "
+                        f"| spread_proxy={sum_err:.3f}"
+                    )
+                    key = make_key(m, "ARB", yes, no)
+                    if should_send(key):
+                        candidates.append((score, m, kind, yes, no, liq, vol24, details))
+                continue  # arbitrage is top priority
 
-        candidates.sort(key=lambda x: x[0], reverse=True)  # melhores scores primeiro
+            # 2) Cheap quote (single side)
+            rec, cheapness = cheap_side(yes, no)
+            if rec:
+                # treat “cheap” as a smaller edge signal (net_gap=0)
+                score = score_combo(yes, no, liq, vol24, 0.0, cheapness, sum_err)
+
+                if score >= SCORE_MIN:
+                    if rec == "BUY_YES":
+                        kind = "CHEAP (BUY YES)"
+                        details = f"AÇÃO: BUY YES (barato). yes={yes:.3f} ≤ {CHEAP_MAX_PRICE:.2f} | spread_proxy={sum_err:.3f}"
+                    else:
+                        kind = "CHEAP (BUY NO)"
+                        details = f"AÇÃO: BUY NO (barato). no={no:.3f} ≤ {CHEAP_MAX_PRICE:.2f} | spread_proxy={sum_err:.3f}"
+
+                    key = make_key(m, "CHEAP", yes, no)
+                    if should_send(key):
+                        candidates.append((score, m, kind, yes, no, liq, vol24, details))
+
+        # send best first
+        candidates.sort(key=lambda x: x[0], reverse=True)
 
         sent = 0
-        for score, m, rec, yes, no, liq, vol24 in candidates[:MAX_ALERTS_PER_CYCLE]:
-            msg = format_buy(m, rec, yes, no, score, tag="BUY ALERT")
-            ok = tg_send(msg)
-            if ok:
+        for score, m, kind, yes, no, liq, vol24, details in candidates[:MAX_ALERTS_PER_CYCLE]:
+            msg = format_alert(m, kind, score, yes, no, liq, vol24, details)
+            if tg_send(msg):
                 sent += 1
-                # salva histórico pro replay
-                title = (m.get("question") or m.get("title") or "Market").strip()
-                append_history({
-                    "ts": now_utc(),
-                    "rec": rec,
-                    "yes": yes,
-                    "no": no,
-                    "liq": liq,
-                    "vol24": vol24,
-                    "title": title,
-                    "url": market_url(m),
-                })
 
         print(f"[{now_utc()}] markets={len(markets)} parse_ok={parse_ok} candidates={len(candidates)} sent={sent} used={used}")
 
         now = time.time()
         if sent == 0 and (now - last_debug) >= DEBUG_EVERY_SEC:
             tg_send(
-                "🧩 DEBUG (sem alertas enviados)\n"
+                "🧩 DEBUG (0 alertas enviados)\n"
                 f"markets={len(markets)} | parse_ok={parse_ok} | candidates={len(candidates)} | sent={sent}\n"
-                f"endpoint={used} | cooldown={REPEAT_COOLDOWN_SEC}s | max/cycle={MAX_ALERTS_PER_CYCLE}\n"
-                f"SCORE_MIN={SCORE_MIN}\n"
+                f"gap_min={ARB_GAP_MIN*100:.2f}% | buffer={FEE_BUFFER*100:.2f}% | cheap≤{CHEAP_MAX_PRICE:.2f}\n"
+                f"sum_err_skip={SUM_ERR_SKIP} | score_min={SCORE_MIN} | endpoint={used}\n"
                 f"Hora: {now_utc()}"
             )
             last_debug = now
