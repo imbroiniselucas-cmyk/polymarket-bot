@@ -15,14 +15,18 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 GAMMA_URL = os.getenv("GAMMA_URL", "https://gamma-api.polymarket.com").rstrip("/")
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "300"))          # 5 min
-SCORE_MIN = float(os.getenv("SCORE_MIN", "20"))               # >= 20
-MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "10"))
-REPEAT_COOLDOWN_MIN = int(os.getenv("REPEAT_COOLDOWN_MIN", "10"))
+# MAIS AGRESSIVO: 3 min por padrão
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "180"))
 
-# Filtros mínimos (bem leves pra não ficar mudo)
-MIN_LIQ = float(os.getenv("MIN_LIQ", "300"))
-MIN_VOL24 = float(os.getenv("MIN_VOL24", "100"))
+# manda mais por ciclo
+MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "15"))
+
+# permite repetir rápido
+REPEAT_COOLDOWN_MIN = int(os.getenv("REPEAT_COOLDOWN_MIN", "5"))
+
+# sem filtro mesmo (mas deixo env vars caso queira ligar depois)
+MIN_LIQ = float(os.getenv("MIN_LIQ", "0"))
+MIN_VOL24 = float(os.getenv("MIN_VOL24", "0"))
 
 # ======================================================
 # HELPERS
@@ -82,9 +86,9 @@ def extract_list(payload):
     return []
 
 # ======================================================
-# FETCH MARKETS (robusto: tenta variações)
+# FETCH MARKETS (robusto, evita vir vazio)
 # ======================================================
-def fetch_markets(limit=400):
+def fetch_markets(limit=500):
     attempts = [
         ("/markets", {
             "active": "true",
@@ -94,7 +98,6 @@ def fetch_markets(limit=400):
             "order": "volume24hr",
             "ascending": "false",
         }),
-        # alguns ambientes aceitam "archived" / "resolved"
         ("/markets", {
             "active": "true",
             "archived": "false",
@@ -104,14 +107,12 @@ def fetch_markets(limit=400):
             "order": "volume24hr",
             "ascending": "false",
         }),
-        # fallback sem order
         ("/markets", {
             "active": "true",
             "closed": "false",
             "limit": str(limit),
             "offset": "0",
         }),
-        # último fallback: eventos (se markets estiver instável)
         ("/events", {
             "active": "true",
             "closed": "false",
@@ -125,7 +126,6 @@ def fetch_markets(limit=400):
             data = gamma_get(path, params=params)
             lst = extract_list(data)
             if lst:
-                # se veio /events, tenta extrair markets dentro
                 if path == "/events":
                     markets = []
                     for ev in lst:
@@ -168,7 +168,6 @@ def parse_yes_no(market: dict):
     if yes is None or no is None:
         return None, None
 
-    # normaliza
     yes = clamp(yes, 0.0, 1.0)
     no = clamp(no, 0.0, 1.0)
     return yes, no
@@ -183,88 +182,91 @@ def market_url(market: dict):
     return "https://polymarket.com"
 
 # ======================================================
-# SCORE (não depende de priceChange)
+# VERY AGGRESSIVE "BUY" SIGNAL
 # ======================================================
-def compute_score(market: dict):
+def compute_aggressive_buy(market: dict):
+    """
+    Sem score mínimo: sempre tenta produzir um BUY YES/NO.
+    Regras:
+      - se YES <= 0.49 => BUY YES (a favor, “barato”)
+      - se YES >= 0.51 => BUY NO  (contra, YES “caro”)
+      - no miolo, usa volume/liquidez pra decidir lado (mean reversion leve)
+    """
     liq = safe_float(market.get("liquidity"), 0.0) or 0.0
     vol24 = safe_float(market.get("volume24hr") or market.get("volume24h"), 0.0) or 0.0
+
     yes, no = parse_yes_no(market)
     if yes is None:
-        return 0.0, None, {}
+        return None
 
-    # "mid preference": favorece preços próximos de 0.5 (mais tradeável)
-    mid_pref = 1.0 - abs(yes - 0.5) * 2.0   # 1 no 0.5, 0 no 0/1
-    mid_pref = clamp(mid_pref, 0, 1)
-
-    # log-normaliza (bem tolerante)
-    liq_n = clamp(math.log10(liq + 1) / 5.0, 0, 1)     # 1e5 ~ 1
-    vol_n = clamp(math.log10(vol24 + 1) / 6.0, 0, 1)   # 1e6 ~ 1
-
-    # penaliza dados estranhos (yes+no muito fora de 1)
+    # checagem de dados “estranhos”
     sum_err = abs((yes + no) - 1.0)
+
+    # decisão super agressiva
+    if yes <= 0.49:
+        rec = "BUY_YES"
+        px = yes
+    elif yes >= 0.51:
+        rec = "BUY_NO"
+        px = no
+    else:
+        # bem no meio: escolhe o lado "mais barato" por centavos
+        rec = "BUY_YES" if yes <= 0.5 else "BUY_NO"
+        px = yes if rec == "BUY_YES" else no
+
+    # “score” só informativo (não filtra)
+    # favorece volume/liq e preços próximos do meio
+    mid_pref = 1.0 - abs(yes - 0.5) * 2.0
+    mid_pref = clamp(mid_pref, 0, 1)
+    liq_n = clamp(math.log10(liq + 1) / 5.0, 0, 1)
+    vol_n = clamp(math.log10(vol24 + 1) / 6.0, 0, 1)
     err_pen = clamp(sum_err * 10.0, 0, 0.7)
 
-    # Score 0-100
-    score = (
-        45.0 * liq_n +
-        35.0 * vol_n +
-        30.0 * mid_pref
-    ) - (35.0 * err_pen)
-
+    score = (45 * liq_n + 35 * vol_n + 30 * mid_pref) - (35 * err_pen)
     score = clamp(score, 0, 100)
 
-    feats = {
-        "liq": liq,
-        "vol24": vol24,
+    return {
+        "rec": rec,
         "yes": yes,
         "no": no,
+        "liq": liq,
+        "vol24": vol24,
         "sum_err": sum_err,
-        "mid_pref": mid_pref,
+        "score": score,
+        "px": px,
     }
-    return score, yes, feats
 
-def decide_buy(feats: dict):
-    """
-    Só compra:
-    - se YES <= 0.48 -> BUY YES
-    - se YES >= 0.52 -> BUY NO
-    - no meio, escolhe o lado "mais barato" (a favor de mean reversion)
-    """
-    yes = feats["yes"]
-    if yes <= 0.48:
-        return "BUY_YES"
-    if yes >= 0.52:
-        return "BUY_NO"
-    return "BUY_YES" if yes < 0.5 else "BUY_NO"
-
-def format_msg(market: dict, score: float, rec: str, feats: dict):
+def format_msg(market: dict, sig: dict):
     title = (market.get("question") or market.get("title") or "Market").strip()
     url = market_url(market)
 
-    yes = feats["yes"]
-    no = feats["no"]
-    liq = feats["liq"]
-    vol24 = feats["vol24"]
+    yes = sig["yes"]
+    no = sig["no"]
+    liq = sig["liq"]
+    vol24 = sig["vol24"]
+    rec = sig["rec"]
+    score = sig["score"]
 
     if rec == "BUY_YES":
         action = "🟢 COMPRA: YES (a favor)"
-        px = yes
+        alvo = yes
     else:
         action = "🔴 COMPRA: NO (contra)"
-        px = no
+        alvo = no
 
     return (
-        f"🚨 ALERTA (BUY) | Score {score:.1f}\n"
+        f"🚨 ALERTA (BUY)\n"
         f"{action}\n"
         f"🧠 {title}\n"
-        f"💰 Preços: YES {yes:.3f} | NO {no:.3f} | alvo {px:.3f}\n"
+        f"💰 YES {yes:.3f} | NO {no:.3f} | alvo {alvo:.3f}\n"
         f"📊 Liq {int(liq)} | Vol24h {int(vol24)}\n"
+        f"📈 Score(info): {score:.1f} (sem filtro)\n"
         f"🔗 {url}\n"
         f"🕒 {now_utc()}"
     )
 
 # ======================================================
-# REPEAT CONTROL (permite repetir, mas evita flood)
+# REPEAT CONTROL (permite repetir, evita flood total)
 # ======================================================
 last_sent = {}  # key -> ts
 
@@ -277,10 +279,10 @@ def should_send(key: str):
         return True
     return False
 
-def make_key(market: dict, rec: str, feats: dict):
+def make_key(market: dict, rec: str, yes: float, no: float):
     mid = market.get("id") or market.get("conditionId") or market.get("slug") or (market.get("question") or "m")
-    # bucket por preço pra repetir quando mexer
-    price = feats["yes"] if rec == "BUY_YES" else feats["no"]
+    # bucket por preço (manda de novo quando mexer)
+    price = yes if rec == "BUY_YES" else no
     bucket = round(price, 3)
     return f"{mid}:{rec}:{bucket}"
 
@@ -291,11 +293,11 @@ def main():
     print("BOOT_OK: main.py running")
 
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        tg_send(f"✅ Bot ON | BUY-only | Score≥{SCORE_MIN} | poll={POLL_SECONDS}s | repeat={REPEAT_COOLDOWN_MIN}min")
+        tg_send(f"✅ Bot ON | BUY-only | SEM filtro de score | poll={POLL_SECONDS}s | repeat={REPEAT_COOLDOWN_MIN}min")
 
     while True:
         try:
-            markets = fetch_markets(limit=400)
+            markets = fetch_markets(limit=500)
             candidates = []
 
             for m in markets:
@@ -304,23 +306,20 @@ def main():
                 if liq < MIN_LIQ or vol24 < MIN_VOL24:
                     continue
 
-                score, yes, feats = compute_score(m)
-                if yes is None:
-                    continue
-                if score < SCORE_MIN:
+                sig = compute_aggressive_buy(m)
+                if not sig:
                     continue
 
-                rec = decide_buy(feats)  # BUY only
-                key = make_key(m, rec, feats)
-
+                key = make_key(m, sig["rec"], sig["yes"], sig["no"])
                 if should_send(key):
-                    candidates.append((score, m, rec, feats))
+                    candidates.append((sig["score"], m, sig))
 
+            # manda primeiro os “melhores” (mas sem filtrar)
             candidates.sort(key=lambda x: x[0], reverse=True)
 
             sent = 0
-            for score, m, rec, feats in candidates[:MAX_ALERTS_PER_CYCLE]:
-                msg = format_msg(m, score, rec, feats)
+            for _, m, sig in candidates[:MAX_ALERTS_PER_CYCLE]:
+                msg = format_msg(m, sig)
                 if tg_send(msg):
                     sent += 1
 
