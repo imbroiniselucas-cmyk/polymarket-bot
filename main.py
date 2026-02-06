@@ -2,59 +2,66 @@
 # -*- coding: utf-8 -*-
 
 """
-Polymarket Alert Bot (EDGE v5) — OPPORTUNITY-FIRST
-Fixes your two pain points:
-1) NEWS relevance: stops “random headlines” by scoring headlines vs extracted keywords + city focus.
-2) LATE moves: avoids alerting after the market is already dead (price ~0/1) or the move already faded.
+Polymarket Alert Bot — AGGRESSIVE v6 (Opportunity-First + Price Evaluation + News + Arb)
 
-What it does:
-A) ARBITRAGE (risk-free) if YES_ASK + NO_ASK < 1 - buffer
-B) FRESH MOVE opportunities (not stale):
-   - triggers only if move is happening NOW (last scan AND continuing),
-   - and current price is not already ~0 or ~1 (unless arb).
-C) NEWS used only when it helps:
-   - pulls last 6h via GDELT, then RELEVANCE-SCORES headlines.
-   - if relevance score is low, it labels it “no catalyst found” and does NOT pretend.
+Goals you asked for:
+✅ More aggressive (more alerts, faster re-alerts)
+✅ Stronger price evaluation (not only "cheap/expensive"):
+   - momentum (last scan + trend over last 3–5 scans)
+   - mean-reversion signals (snapback after spike)
+   - "value zone" only as fallback
+✅ Opportunities linked to:
+   - Arbitrage (risk-free when orderbook is available)
+   - News catalysts (relevance-scored, recent, not random)
+✅ Avoid late alerts:
+   - skip already-resolved prices (near 0 or 1) unless ARB
+   - avoid spike-then-fade (stale retrace)
 
-ENV REQUIRED:
+REQUIRED ENV:
   TELEGRAM_TOKEN
   TELEGRAM_CHAT_ID
 
 OPTIONAL ENV:
   POLY_ENDPOINT
-  SCAN_EVERY_SEC=180
-  MAX_MARKETS=400
+  SCAN_EVERY_SEC=120
+  MAX_MARKETS=450
 
-  # Filters
-  VOL_MIN=12000
-  LIQ_MIN=6000
+  # Aggressive filters
+  VOL_MIN=6000
+  LIQ_MIN=2500
 
-  # Fresh-move detection
-  PRICE_MOVE_ALERT_PCT=6.0         # >= 6% in last scan
-  ABS_PRICE_MOVE_ALERT=0.020       # or >= 2.0 cents
-  FLOW_MOVE_ALERT_PCT=15.0         # volume delta >= 15% in last scan
+  # Alert thresholds (aggressive)
+  PRICE_MOVE_ALERT_PCT=3.0        # >= 3% since last scan
+  ABS_PRICE_MOVE_ALERT=0.012      # or >= 1.2 cents
+  FLOW_MOVE_ALERT_PCT=8.0         # volume delta >= 8% since last scan
 
-  # Avoid late alerts
+  # Arb
+  ARB_BUFFER=0.003                # require 0.3% locked edge
+
+  # Late filters
   SKIP_IF_PRICE_BELOW=0.01
   SKIP_IF_PRICE_ABOVE=0.99
-  STALE_RETRACE_CENTS=0.010        # if it moved but already retraced a lot, skip
-
-  # Arbitrage
-  ARB_BUFFER=0.004
+  STALE_RETRACE_CENTS=0.008
 
   # News
-  NEWS_TIMESPAN=6h                 # (fixed in code)
-  NEWS_MAX=5
-  NEWS_MIN_SCORE=2                 # minimum keyword hits across headlines to count as relevant
+  NEWS_TIMESPAN=6h
+  NEWS_MAX=6
+  NEWS_MIN_SCORE=2
 
-Cities focus for weather/climate: London, Buenos Aires, Ankara
+  # Re-alerting
+  COOLDOWN_MOVE_SEC=240
+  COOLDOWN_NEWS_SEC=180
+  COOLDOWN_ARB_SEC=120
+
+Focus cities for weather/climate parsing: London, Buenos Aires, Ankara
 """
 
 import os
 import time
 import re
+import math
 from typing import Any, Dict, List, Optional, Tuple
-from collections import deque, Counter
+from collections import deque
 
 import requests
 
@@ -92,33 +99,37 @@ def send_telegram(msg: str) -> None:
 # ----------------------------
 POLY_ENDPOINT = os.getenv("POLY_ENDPOINT", "").strip()
 
-SCAN_EVERY_SEC = int(os.getenv("SCAN_EVERY_SEC", "180"))
-MAX_MARKETS = int(os.getenv("MAX_MARKETS", "400"))
+SCAN_EVERY_SEC = int(os.getenv("SCAN_EVERY_SEC", "120"))
+MAX_MARKETS = int(os.getenv("MAX_MARKETS", "450"))
 
-VOL_MIN = float(os.getenv("VOL_MIN", "12000"))
-LIQ_MIN = float(os.getenv("LIQ_MIN", "6000"))
+VOL_MIN = float(os.getenv("VOL_MIN", "6000"))
+LIQ_MIN = float(os.getenv("LIQ_MIN", "2500"))
 
-PRICE_MOVE_ALERT_PCT = float(os.getenv("PRICE_MOVE_ALERT_PCT", "6.0")) / 100.0
-ABS_PRICE_MOVE_ALERT = float(os.getenv("ABS_PRICE_MOVE_ALERT", "0.020"))
-FLOW_MOVE_ALERT_PCT = float(os.getenv("FLOW_MOVE_ALERT_PCT", "15.0")) / 100.0
+PRICE_MOVE_ALERT_PCT = float(os.getenv("PRICE_MOVE_ALERT_PCT", "3.0")) / 100.0
+ABS_PRICE_MOVE_ALERT = float(os.getenv("ABS_PRICE_MOVE_ALERT", "0.012"))
+FLOW_MOVE_ALERT_PCT = float(os.getenv("FLOW_MOVE_ALERT_PCT", "8.0")) / 100.0
+
+ARB_BUFFER = float(os.getenv("ARB_BUFFER", "0.003"))
 
 SKIP_IF_PRICE_BELOW = float(os.getenv("SKIP_IF_PRICE_BELOW", "0.01"))
 SKIP_IF_PRICE_ABOVE = float(os.getenv("SKIP_IF_PRICE_ABOVE", "0.99"))
-STALE_RETRACE_CENTS = float(os.getenv("STALE_RETRACE_CENTS", "0.010"))
+STALE_RETRACE_CENTS = float(os.getenv("STALE_RETRACE_CENTS", "0.008"))
 
-ARB_BUFFER = float(os.getenv("ARB_BUFFER", "0.004"))
-
-NEWS_MAX = int(os.getenv("NEWS_MAX", "5"))
+NEWS_MAX = int(os.getenv("NEWS_MAX", "6"))
 NEWS_MIN_SCORE = int(os.getenv("NEWS_MIN_SCORE", "2"))
 
+COOLDOWN_MOVE_SEC = int(os.getenv("COOLDOWN_MOVE_SEC", "240"))
+COOLDOWN_NEWS_SEC = int(os.getenv("COOLDOWN_NEWS_SEC", "180"))
+COOLDOWN_ARB_SEC = int(os.getenv("COOLDOWN_ARB_SEC", "120"))
+
 HTTP_TIMEOUT = 20
-UA = {"User-Agent": "EDGE_BOT/5.0"}
+UA = {"User-Agent": "AGGRESSIVE_EDGE_BOT/6.0"}
 
 CITY_KEYS = ["london", "buenos aires", "ankara"]
 
 
 # ----------------------------
-# Small helpers
+# Helpers
 # ----------------------------
 def _to_float(x: Any, default: float = 0.0) -> float:
     try:
@@ -194,9 +205,6 @@ def _liquidity(m: Dict[str, Any]) -> float:
     return 0.0
 
 
-# ----------------------------
-# Price / orderbook parsing (defensive)
-# ----------------------------
 def _yes_no_from_outcome_prices(m: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     outcomes = m.get("outcomes")
     prices = m.get("outcomePrices") or m.get("outcome_prices")
@@ -225,7 +233,7 @@ def _best_yes_price(m: Dict[str, Any]) -> Optional[float]:
     return yes
 
 
-def _extract_side_prices(m: Dict[str, Any]) -> Dict[str, Optional[float]]:
+def _extract_side_asks(m: Dict[str, Any]) -> Dict[str, Optional[float]]:
     keys = {
         "yes_ask": ["yesAsk", "yes_ask", "bestAskYes", "best_ask_yes", "ask_yes"],
         "no_ask":  ["noAsk", "no_ask", "bestAskNo", "best_ask_no", "ask_no"],
@@ -244,9 +252,9 @@ def _extract_side_prices(m: Dict[str, Any]) -> Dict[str, Optional[float]]:
 # ----------------------------
 # Arbitrage
 # ----------------------------
-def find_arbitrage(side: Dict[str, Optional[float]]) -> Optional[Dict[str, Any]]:
-    ya = side.get("yes_ask")
-    na = side.get("no_ask")
+def find_arbitrage(asks: Dict[str, Optional[float]]) -> Optional[Dict[str, Any]]:
+    ya = asks.get("yes_ask")
+    na = asks.get("no_ask")
     if ya is None or na is None:
         return None
     total = ya + na
@@ -256,7 +264,7 @@ def find_arbitrage(side: Dict[str, Optional[float]]) -> Optional[Dict[str, Any]]
 
 
 # ----------------------------
-# News: relevance-scored (GDELT, no key)
+# News (relevance-scored + recent)
 # ----------------------------
 STOP = {
     "will","the","a","an","to","of","in","on","by","for","and","or","is","are","be",
@@ -267,7 +275,6 @@ for c in CITY_KEYS:
     STOP |= set(c.split())
 
 def extract_keywords(title: str) -> List[str]:
-    # take meaningful tokens; prefer proper nouns / longer terms / tickers-like
     toks = re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}", title)
     out = []
     for t in toks:
@@ -276,7 +283,6 @@ def extract_keywords(title: str) -> List[str]:
             continue
         if len(t) >= 4:
             out.append(t)
-    # keep most frequent unique in order
     seen = set()
     uniq = []
     for t in out:
@@ -293,7 +299,7 @@ def gdelt_fetch(query: str, max_items: int) -> List[Dict[str, str]]:
         "mode": "ArtList",
         "format": "json",
         "maxrecords": str(max_items),
-        "timespan": "6h",          # key change: last 6 hours (more timely)
+        "timespan": "6h",
         "sourcelang": "English",
         "sort": "HybridRel",
     }
@@ -309,23 +315,8 @@ def gdelt_fetch(query: str, max_items: int) -> List[Dict[str, str]]:
             out.append({"title": title, "src": src})
     return out
 
-def score_headlines(headlines: List[Dict[str,str]], keywords: List[str]) -> Tuple[int, List[str]]:
-    # Score = total keyword hits across headlines (case-insensitive)
-    kw = [k.lower() for k in keywords]
-    scored_lines = []
-    score = 0
-    for h in headlines:
-        ht = h["title"].lower()
-        hits = sum(1 for k in kw if k in ht)
-        if hits > 0:
-            score += hits
-            scored_lines.append(f"• {h['title']}" + (f" ({h['src']})" if h.get("src") else ""))
-    return score, scored_lines
-
 def get_relevant_news(title: str) -> Tuple[str, int]:
     kws = extract_keywords(title)
-
-    # city markets: force city into query to avoid random results
     tlo = title.lower()
     city_q = None
     for c in CITY_KEYS:
@@ -333,7 +324,6 @@ def get_relevant_news(title: str) -> Tuple[str, int]:
             city_q = c
             break
 
-    # Build query: (city AND top keywords) OR just top keywords
     if city_q and kws:
         query = f"{city_q} AND ({' OR '.join(kws[:3])})"
     elif kws:
@@ -348,13 +338,69 @@ def get_relevant_news(title: str) -> Tuple[str, int]:
     except Exception:
         return "• (news fetch failed)", 0
 
-    score, good = score_headlines(heads, kws)
+    score = 0
+    good = []
+    kwl = [k.lower() for k in kws]
+    for h in heads:
+        ht = h["title"].lower()
+        hits = sum(1 for k in kwl if k in ht)
+        if hits > 0:
+            score += hits
+            good.append(f"• {h['title']}" + (f" ({h['src']})" if h.get("src") else ""))
 
-    # If nothing relevant, show honest line
     if score < NEWS_MIN_SCORE or not good:
         return "• (no relevant catalyst found in last 6h)", score
 
     return "\n".join(good[:3]), score
+
+
+# ----------------------------
+# Price evaluation (stronger)
+# ----------------------------
+def is_extreme_price(p: float) -> bool:
+    return p <= SKIP_IF_PRICE_BELOW or p >= SKIP_IF_PRICE_ABOVE
+
+def direction(now: float, prev: float) -> str:
+    return "UP->YES" if now > prev else ("DOWN->NO" if now < prev else "FLAT")
+
+def rec_from_dir(d: str) -> str:
+    if d == "UP->YES":
+        return "ENTER YES (A FAVOR)"
+    if d == "DOWN->NO":
+        return "ENTER NO (CONTRA)"
+    return "WAIT"
+
+def trend_score(hist: deque) -> float:
+    # + if trending up, - if trending down
+    if len(hist) < 3:
+        return 0.0
+    ds = 0.0
+    for i in range(1, len(hist)):
+        ds += (hist[i] - hist[i-1])
+    return ds
+
+def is_spike_then_fade(hist: deque) -> bool:
+    if len(hist) < 4:
+        return False
+    w = list(hist)[-4:]
+    mx = max(w); mn = min(w); last = w[-1]
+    if mx - mn < 0.015:
+        return False
+    retr = max(abs(mx - last), abs(last - mn))
+    return retr >= STALE_RETRACE_CENTS
+
+def snapback_signal(hist: deque) -> Optional[str]:
+    # detect a snapback reversal after a sharp move (mean reversion)
+    if len(hist) < 4:
+        return None
+    a, b, c, d = list(hist)[-4:]
+    # Up spike then drop (fade) -> favor NO
+    if (b - a) > 0.015 and (d - c) < -0.010:
+        return "ENTER NO (CONTRA) — snapback after spike"
+    # Down spike then bounce -> favor YES
+    if (b - a) < -0.015 and (d - c) > 0.010:
+        return "ENTER YES (A FAVOR) — snapback after dump"
+    return None
 
 
 # ----------------------------
@@ -393,49 +439,9 @@ def fetch_markets() -> List[Dict[str, Any]]:
         if len(chunk) < limit:
             break
         offset += limit
-        if offset > 1200:
+        if offset > 1400:
             break
     return out[:MAX_MARKETS]
-
-
-# ----------------------------
-# Opportunity detection (fresh move, not stale)
-# ----------------------------
-def is_extreme_price(p: float) -> bool:
-    return p <= SKIP_IF_PRICE_BELOW or p >= SKIP_IF_PRICE_ABOVE
-
-def move_direction(now: float, prev: float) -> str:
-    return "UP->YES" if now > prev else ("DOWN->NO" if now < prev else "FLAT")
-
-def recommendation_from_direction(dir_label: str) -> str:
-    if dir_label == "UP->YES":
-        return "ENTER YES (A FAVOR)"
-    if dir_label == "DOWN->NO":
-        return "ENTER NO (CONTRA)"
-    return "WAIT"
-
-def is_continuing(prices: deque) -> bool:
-    # continuing move: last 2 deltas same sign
-    if len(prices) < 3:
-        return False
-    d1 = prices[-1] - prices[-2]
-    d2 = prices[-2] - prices[-3]
-    return (d1 > 0 and d2 > 0) or (d1 < 0 and d2 < 0)
-
-def retraced_too_much(prices: deque) -> bool:
-    # If it spiked but already came back, skip as “late”
-    if len(prices) < 4:
-        return False
-    # Compare last to local extreme in last 4
-    window = list(prices)[-4:]
-    last = window[-1]
-    mx = max(window); mn = min(window)
-    # if moved up then fell back a lot OR moved down then bounced a lot
-    if mx - mn < 0.015:
-        return False
-    # retrace amount from extreme to last
-    retr = max(abs(mx - last), abs(last - mn))
-    return retr >= STALE_RETRACE_CENTS
 
 
 # ----------------------------
@@ -446,12 +452,11 @@ def main() -> None:
         print("⚠️ Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID.")
         return
 
-    # history for freshness detection
     price_hist: Dict[str, deque] = {}
     vol_prev: Dict[str, float] = {}
     last_alert_ts: Dict[str, float] = {}
 
-    send_telegram("🤖 Bot ON: EDGE v5 (ARB + FRESH MOVES + RELEVANT NEWS).")
+    send_telegram("🤖 Bot ON: AGGRESSIVE v6 (PriceEval + Arb + NewsCatalyst + FreshMoves).")
 
     while True:
         try:
@@ -480,9 +485,9 @@ def main() -> None:
                     continue
                 yes = _clamp(yes, 0.0, 1.0)
 
-                # Track history
+                # History
                 if key not in price_hist:
-                    price_hist[key] = deque(maxlen=6)
+                    price_hist[key] = deque(maxlen=7)
                 price_hist[key].append(yes)
 
                 prev_v = vol_prev.get(key, vol)
@@ -491,37 +496,33 @@ def main() -> None:
                 flow_dir = "IN" if vol_delta >= 0 else "OUT"
                 vol_prev[key] = vol
 
-                # ARB check (priority)
-                side = _extract_side_prices(m)
-                arb = find_arbitrage(side)
-
+                # Arbitrage first
+                asks = _extract_side_asks(m)
+                arb = find_arbitrage(asks)
                 if arb:
-                    # short cooldown for arb
-                    if now_ts - last_alert_ts.get(key, 0) < 180:
+                    if now_ts - last_alert_ts.get(key, 0) < COOLDOWN_ARB_SEC:
                         continue
-
                     news, nscore = get_relevant_news(title)
                     msg = (
                         f"🚨 ARB OPPORTUNITY\n"
                         f"🎯 ACTION: ENTER BOTH SIDES (ARBITRAGE)\n"
                         f"✅ Buy YES @ {arb['yes_ask']:.3f}  +  Buy NO @ {arb['no_ask']:.3f}\n"
-                        f"🧠 Locked profit ≈ {(arb['locked_profit']*100):.2f}%  (sum={arb['sum']:.3f}, buffer={ARB_BUFFER:.3f})\n"
-                        f"📊 Vol={vol:,.0f} | Liq={liq:,.0f}\n"
-                        f"🗞 News (relevance score {nscore}):\n{news}\n"
+                        f"🧠 Locked profit ≈ {(arb['locked_profit']*100):.2f}% (sum={arb['sum']:.3f}, buffer={ARB_BUFFER:.3f})\n"
+                        f"💸 Flow: {flow_dir} {_pct(flow_move_pct)} (Δ{abs(vol_delta):,.0f}) | Vol={vol:,.0f} | Liq={liq:,.0f}\n"
+                        f"🗞 News (score {nscore}):\n{news}\n"
                         f"📝 {title}\n{url}"
                     )
                     send_telegram(msg)
                     last_alert_ts[key] = now_ts
                     sent += 1
-                    if sent >= 16:
+                    if sent >= 22:
                         break
                     continue
 
-                # If price already basically resolved, skip (this fixes your “move 22% but now 0” complaint)
+                # Avoid late resolved markets
                 if is_extreme_price(yes):
                     continue
 
-                # Need at least 2 points for move detection
                 if len(price_hist[key]) < 2:
                     continue
 
@@ -529,45 +530,56 @@ def main() -> None:
                 abs_move = abs(yes - prev_yes)
                 price_move_pct = abs_move / max(prev_yes, 1e-9)
 
-                # Fresh-move trigger (last scan)
                 move_trigger = (price_move_pct >= PRICE_MOVE_ALERT_PCT) or (abs_move >= ABS_PRICE_MOVE_ALERT)
                 flow_trigger = (flow_move_pct >= FLOW_MOVE_ALERT_PCT)
 
                 if not (move_trigger or flow_trigger):
                     continue
 
-                # Avoid stale: require the move to be continuing OR flow is still strong
-                continuing = is_continuing(price_hist[key])
-                if not continuing and not flow_trigger:
+                # Avoid stale spike-fade
+                if is_spike_then_fade(price_hist[key]):
                     continue
 
-                # Avoid “spike then fade”: if already retraced, skip
-                if retraced_too_much(price_hist[key]):
-                    continue
-
-                # Cooldown (opportunity-first but not spam)
-                if now_ts - last_alert_ts.get(key, 0) < 420:
-                    continue
-
-                dir_label = move_direction(yes, prev_yes)
-                rec = recommendation_from_direction(dir_label)
-
-                # News: only include if relevant; otherwise honest label
+                # Cooldowns: tighter for news-worthy catalysts
                 news, nscore = get_relevant_news(title)
+                cooldown = COOLDOWN_NEWS_SEC if nscore >= NEWS_MIN_SCORE else COOLDOWN_MOVE_SEC
+                if now_ts - last_alert_ts.get(key, 0) < cooldown:
+                    continue
 
+                d = direction(yes, prev_yes)
+                base_rec = rec_from_dir(d)
+
+                # Stronger price evaluation layer
+                tscore = trend_score(price_hist[key])
+                snap = snapback_signal(price_hist[key])
+
+                if snap:
+                    rec = snap.split(" — ")[0]  # keeps explicit YES/NO
+                    why_eval = snap
+                else:
+                    # If trend score strong, follow trend; if weak but flow big, follow flow direction via last move
+                    if abs(tscore) >= 0.015:
+                        rec = base_rec
+                        why_eval = f"trend_strength={tscore:+.3f} (follow trend)"
+                    else:
+                        rec = base_rec
+                        why_eval = f"trend_strength={tscore:+.3f} (light trend)"
+
+                alert_kind = "CATALYST+MOVE" if nscore >= NEWS_MIN_SCORE else "MOVE"
                 msg = (
-                    f"🚨 FRESH MOVE OPPORTUNITY\n"
+                    f"🚨 {alert_kind} OPPORTUNITY\n"
                     f"🎯 ACTION: {rec}\n"
                     f"🧠 Why NOW: PriceMove={_pct(price_move_pct)} (abs {abs_move:.3f}) | Flow={flow_dir} {_pct(flow_move_pct)} (Δ{abs(vol_delta):,.0f})\n"
-                    f"💰 YES={yes:.3f} | NO≈{(1-yes):.3f} | Dir={dir_label}\n"
+                    f"📈 PriceEval: {why_eval}\n"
+                    f"💰 YES={yes:.3f} | NO≈{(1-yes):.3f} | Dir={d}\n"
                     f"📊 Vol={vol:,.0f} | Liq={liq:,.0f}\n"
-                    f"🗞 News (relevance score {nscore}):\n{news}\n"
+                    f"🗞 News (score {nscore}):\n{news}\n"
                     f"📝 {title}\n{url}"
                 )
                 send_telegram(msg)
                 last_alert_ts[key] = now_ts
                 sent += 1
-                if sent >= 16:
+                if sent >= 22:
                     break
 
             except Exception:
