@@ -1,43 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Polymarket Alert Bot — Aggressive BUT Spread-Safe
+Polymarket Alert Bot — BUY-ONLY (NO WATCH) + Spread-Safe + Less Spam
 
-Goals:
-✅ Many alerts every 5–10 min
-✅ Avoid "fake profit" situations caused by huge spread (bad exit)
-✅ Clear recommendation: BUY YES / BUY NO / BUY BOTH (arb-ish) / WATCH / AVOID
-✅ Force-send TopN picks every loop so it won't stay silent
+Only sends alerts when the recommendation is a BUY:
+✅ BUY YES
+✅ BUY NO
+✅ BUY BOTH (arb-ish)
 
-Why spread filter matters:
-Polymarket UI often shows midpoint/last-trade; if spread is large, your SELL hits bestBid which can be far lower. :contentReference[oaicite:1]{index=1}
+Never sends:
+❌ WATCH
+❌ AVOID
+
+Still protects you from bad exits:
+- Requires bid/ask exist
+- Requires spread <= MAX_SPREAD
+- Requires bid >= MIN_BID
 
 REQUIRED ENV (Railway Variables):
 - TELEGRAM_TOKEN=xxxx
 - TELEGRAM_CHAT_ID=yyyy
 
-Recommended aggressive defaults (can override via ENV):
-- LOOP_SECONDS=300          (5 min)  OR  600 (10 min)
-- MAX_PAGES=10              (markets pagination pages)
-- PAGE_LIMIT=200            (items per page)
-- MIN_LIQ=300               (very flexible)
-- MIN_VOL24H=100            (very flexible)
-- MAX_SPREAD=0.08           (HARD FILTER: skip if spread > 8 cents)
-- MIN_BID=0.02              (skip if bestBid is basically dead)
-- CHEAP_MAX=0.15
-- EXPENSIVE_MIN=0.90
-- ARB_EDGE=0.008
-- MOVE_PCT_ALERT=0.8
-- VOL_DELTA_ALERT=1500
-- COOLDOWN_MIN=8
-- ALWAYS_SEND_TOPN=6
+Defaults (low spam):
+- LOOP_SECONDS=600
+- MIN_LIQ=8000
+- MIN_VOL24H=5000
+- MAX_SPREAD=0.05
+- MIN_BID=0.05
+- SCORE_ALERT=65
+- MOVE_PCT_ALERT=2.0
+- VOL_DELTA_ALERT=8000
+- COOLDOWN_MIN=35
+- ALWAYS_SEND_TOPN=0        # important: no forced picks
 - SEND_DIAGNOSTIC=1
 """
 
 import os
 import time
 import json
-import math
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -48,35 +48,31 @@ import requests
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-LOOP_SECONDS = int(os.getenv("LOOP_SECONDS", "300"))  # 300=5min, 600=10min
-
-# We'll scan markets directly (better fields: bestBid/bestAsk/spread)
+LOOP_SECONDS = int(os.getenv("LOOP_SECONDS", "600"))  # 10 min
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 
-MAX_PAGES = int(os.getenv("MAX_PAGES", "10"))
+MAX_PAGES = int(os.getenv("MAX_PAGES", "8"))
 PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "200"))
 
-MIN_LIQ = float(os.getenv("MIN_LIQ", "300"))
-MIN_VOL24H = float(os.getenv("MIN_VOL24H", "100"))
+MIN_LIQ = float(os.getenv("MIN_LIQ", "8000"))
+MIN_VOL24H = float(os.getenv("MIN_VOL24H", "5000"))
 
-# SPREAD SAFETY (key part)
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.08"))  # 8 cents
-MIN_BID = float(os.getenv("MIN_BID", "0.02"))        # if bid < 2c, exit is trash
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.05"))
+MIN_BID = float(os.getenv("MIN_BID", "0.05"))
 
-CHEAP_MAX = float(os.getenv("CHEAP_MAX", "0.15"))
-EXPENSIVE_MIN = float(os.getenv("EXPENSIVE_MIN", "0.90"))
-ARB_EDGE = float(os.getenv("ARB_EDGE", "0.008"))
+CHEAP_MAX = float(os.getenv("CHEAP_MAX", "0.12"))
+ARB_EDGE = float(os.getenv("ARB_EDGE", "0.010"))
 
-MOVE_PCT_ALERT = float(os.getenv("MOVE_PCT_ALERT", "0.8"))
-VOL_DELTA_ALERT = float(os.getenv("VOL_DELTA_ALERT", "1500"))
+SCORE_ALERT = float(os.getenv("SCORE_ALERT", "65"))
+MOVE_PCT_ALERT = float(os.getenv("MOVE_PCT_ALERT", "2.0"))
+VOL_DELTA_ALERT = float(os.getenv("VOL_DELTA_ALERT", "8000"))
 
-COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "8"))
-ALWAYS_SEND_TOPN = int(os.getenv("ALWAYS_SEND_TOPN", "6"))
+COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "35"))
+ALWAYS_SEND_TOPN = int(os.getenv("ALWAYS_SEND_TOPN", "0"))  # default OFF for buy-only
 SEND_DIAGNOSTIC = os.getenv("SEND_DIAGNOSTIC", "1").strip() not in ("0", "false", "False", "")
 
 HTTP_TIMEOUT = 20
 STATE_FILE = "state.json"
-
 PM_MARKET_BASE = "https://polymarket.com/market/"
 
 
@@ -128,11 +124,7 @@ def tg_send(msg: str) -> None:
         return
 
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": msg,
-        "disable_web_page_preview": True,
-    }
+    payload = {"chat_id": TG_CHAT_ID, "text": msg, "disable_web_page_preview": True}
     try:
         r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
         if r.status_code >= 300:
@@ -146,11 +138,22 @@ def market_url(m: Dict[str, Any]) -> str:
     return PM_MARKET_BASE + slug if slug else "(no slug)"
 
 
+def fetch_markets_page(offset: int, limit: int) -> List[Dict[str, Any]]:
+    params = {
+        "active": "true",
+        "closed": "false",
+        "limit": str(limit),
+        "offset": str(offset),
+        "order": "volume24hr",
+        "ascending": "false",
+    }
+    r = requests.get(GAMMA_MARKETS_URL, params=params, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    return data if isinstance(data, list) else []
+
+
 def parse_yes_no_prices(m: Dict[str, Any]) -> Optional[Tuple[float, float]]:
-    """
-    Gamma provides outcomes + outcomePrices as JSON strings sometimes.
-    We still parse them to get YES/NO "display" prices.
-    """
     outcomes = m.get("outcomes")
     prices = m.get("outcomePrices")
     try:
@@ -172,7 +175,6 @@ def parse_yes_no_prices(m: Dict[str, Any]) -> Optional[Tuple[float, float]]:
 
     yes = mapping.get("yes")
     no = mapping.get("no")
-
     if yes is None or no is None:
         yes = safe_float(prices[0], 0.0)
         no = safe_float(prices[1], 0.0)
@@ -180,116 +182,69 @@ def parse_yes_no_prices(m: Dict[str, Any]) -> Optional[Tuple[float, float]]:
     return clamp(yes, 0.0, 1.0), clamp(no, 0.0, 1.0)
 
 
-def fetch_markets_page(offset: int, limit: int) -> List[Dict[str, Any]]:
-    params = {
-        "active": "true",
-        "closed": "false",
-        "limit": str(limit),
-        "offset": str(offset),
-        # ordering by 24h volume keeps the scan relevant
-        "order": "volume24hr",
-        "ascending": "false",
-    }
-    r = requests.get(GAMMA_MARKETS_URL, params=params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    return data if isinstance(data, list) else []
-
-
-# ------------------------ Spread-safe checks ------------------------
 def spread_fields(m: Dict[str, Any]) -> Tuple[float, float, float]:
-    """
-    Returns (best_bid, best_ask, spread)
-    Gamma docs show these fields exist. :contentReference[oaicite:2]{index=2}
-    """
     bid = safe_float(m.get("bestBid"), 0.0)
     ask = safe_float(m.get("bestAsk"), 0.0)
     spr = safe_float(m.get("spread"), 0.0)
-    # if spread missing, compute if possible
     if spr <= 0 and bid > 0 and ask > 0:
         spr = max(0.0, ask - bid)
     return bid, ask, spr
 
 
-def pass_spread_safety(m: Dict[str, Any]) -> Tuple[bool, str]:
+def pass_spread_safety(m: Dict[str, Any]) -> bool:
     bid, ask, spr = spread_fields(m)
-
     if bid <= 0 or ask <= 0:
-        return False, "no bid/ask"
+        return False
     if bid < MIN_BID:
-        return False, f"bid too low ({bid:.3f})"
+        return False
     if spr > MAX_SPREAD:
-        return False, f"spread too wide ({spr:.3f} > {MAX_SPREAD:.2f})"
-    return True, f"spread ok ({spr:.3f})"
+        return False
+    return True
 
 
-# ------------------------ Scoring / Recommendation ------------------------
-def compute_score(
-    yes: float, no: float,
-    liq: float, vol24: float,
-    move_pct: float, vol_delta: float,
-    arb_gap: float,
-    bid: float, ask: float, spr: float
-) -> float:
+# ------------------------ BUY-ONLY Recommendation ------------------------
+def buy_action(yes: float, no: float, arb_gap: float) -> Optional[Tuple[str, str]]:
+    """
+    Returns BUY action + hint, or None if it's not a BUY.
+    """
+    if arb_gap >= ARB_EDGE:
+        return ("✅ BUY BOTH (ARB-ISH)", f"YES+NO={yes+no:.3f} gap={arb_gap:.3f}")
+    if yes <= CHEAP_MAX:
+        return ("✅ BUY YES (cheap)", f"YES={yes:.3f} ≤ {CHEAP_MAX:.2f}")
+    if no <= CHEAP_MAX:
+        return ("✅ BUY NO (cheap)", f"NO={no:.3f} ≤ {CHEAP_MAX:.2f}")
+    return None  # WATCH/AVOID removed
+
+
+def compute_score(yes: float, no: float, move_pct: float, vol_delta: float, spr: float, arb_gap: float) -> float:
     cheap_side = min(yes, no)
     cheapness = 0.0
     if cheap_side <= CHEAP_MAX:
         cheapness = (CHEAP_MAX - cheap_side) / max(CHEAP_MAX, 1e-9)
 
-    arb_component = clamp(arb_gap / max(ARB_EDGE, 1e-9), 0.0, 2.5)
-    move_component = clamp(abs(move_pct) / 5.0, 0.0, 2.0)
-    vol_component = clamp(vol_delta / max(VOL_DELTA_ALERT, 1.0), 0.0, 2.5)
+    arb_component = clamp(arb_gap / max(ARB_EDGE, 1e-9), 0.0, 2.0)
+    move_component = clamp(abs(move_pct) / 6.0, 0.0, 1.5)
+    vol_component = clamp(vol_delta / max(VOL_DELTA_ALERT, 1.0), 0.0, 1.5)
+    spread_bonus = clamp((MAX_SPREAD - spr) / max(MAX_SPREAD, 1e-9), 0.0, 1.0)
 
-    # reward tighter spreads (safer exit)
-    spread_bonus = clamp((MAX_SPREAD - spr) / max(MAX_SPREAD, 1e-9), 0.0, 1.0)  # 0..1
-
-    # very light quality weighting (still aggressive)
-    quality = clamp(math.log10(max(liq, 1.0)) / 6.0, 0.0, 1.0)
-    activity = clamp(math.log10(max(vol24, 1.0)) / 7.0, 0.0, 1.0)
-
-    raw = (
-        30.0 * cheapness +
-        28.0 * arb_component +
-        17.0 * move_component +
-        17.0 * vol_component +
-        6.0 * spread_bonus +
-        1.0 * quality +
-        1.0 * activity
-    )
+    raw = 45.0 * cheapness + 30.0 * arb_component + 15.0 * move_component + 7.0 * vol_component + 3.0 * spread_bonus
     return clamp(raw, 0.0, 100.0)
 
 
-def recommendation(yes: float, no: float, arb_gap: float) -> Tuple[str, str]:
-    if arb_gap >= ARB_EDGE:
-        return ("✅ ACTION: ARB-ISH → BUY BOTH (YES + NO) now", f"YES+NO={yes+no:.3f} (gap={arb_gap:.3f})")
-    if yes <= CHEAP_MAX:
-        return ("✅ ACTION: BUY YES now (cheap)", f"YES={yes:.3f} ≤ {CHEAP_MAX:.2f}")
-    if no <= CHEAP_MAX:
-        return ("✅ ACTION: BUY NO now (cheap)", f"NO={no:.3f} ≤ {CHEAP_MAX:.2f}")
-    if yes >= EXPENSIVE_MIN:
-        return ("⚠️ ACTION: AVOID YES (expensive) → prefer NO / wait", f"YES={yes:.3f} ≥ {EXPENSIVE_MIN:.2f}")
-    if no >= EXPENSIVE_MIN:
-        return ("⚠️ ACTION: AVOID NO (expensive) → prefer YES / wait", f"NO={no:.3f} ≥ {EXPENSIVE_MIN:.2f}")
-    return ("👀 ACTION: WATCH", "no cheap/arb/overpriced signal")
-
-
-def should_alert(score: float, move_pct: float, vol_delta: float, arb_gap: float, yes: float, no: float) -> bool:
-    if score >= 45:
+def should_alert_buy(score: float, move_pct: float, vol_delta: float) -> bool:
+    # Stricter trigger (less spam)
+    if score >= SCORE_ALERT:
         return True
-    if arb_gap >= ARB_EDGE:
+    if abs(move_pct) >= MOVE_PCT_ALERT and vol_delta >= (0.7 * VOL_DELTA_ALERT):
         return True
-    if yes <= CHEAP_MAX or no <= CHEAP_MAX:
-        return True
-    if abs(move_pct) >= MOVE_PCT_ALERT:
-        return True
-    if vol_delta >= VOL_DELTA_ALERT:
+    if vol_delta >= VOL_DELTA_ALERT and abs(move_pct) >= 1.2:
         return True
     return False
 
 
 def cooldown_ok(state: Dict[str, Any], key: str, score: float) -> bool:
     last = int(state.setdefault("cooldown", {}).get(key, 0) or 0)
-    if score >= 80:
+    if score >= 85:
         return True
     return (now_ts() - last) >= (COOLDOWN_MIN * 60)
 
@@ -300,14 +255,11 @@ def set_cooldown(state: Dict[str, Any], key: str) -> None:
 
 # ------------------------ Scan Loop ------------------------
 def scan_once(state: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
-    """
-    Returns: sent, scanned, eligible, spread_filtered_out, errors
-    """
-    errors = 0
+    sent = 0
     scanned = 0
     eligible = 0
     spread_out = 0
-    sent = 0
+    errors = 0
 
     seen = state.setdefault("seen", {})
 
@@ -321,7 +273,7 @@ def scan_once(state: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
             print("fetch markets error:", repr(e))
             break
 
-    candidates = []  # (score, key, market, ...)
+    candidates = []  # for optional forced buys only
 
     for m in markets:
         scanned += 1
@@ -332,9 +284,7 @@ def scan_once(state: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
         if liq < MIN_LIQ or vol24 < MIN_VOL24H:
             continue
 
-        # spread safety filter
-        ok_spread, spread_reason = pass_spread_safety(m)
-        if not ok_spread:
+        if not pass_spread_safety(m):
             spread_out += 1
             continue
 
@@ -343,11 +293,11 @@ def scan_once(state: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
             continue
         yes, no = yn
 
-        bid, ask, spr = spread_fields(m)
-
         key = str(m.get("conditionId") or m.get("id") or m.get("slug") or "")
         if not key:
             continue
+
+        bid, ask, spr = spread_fields(m)
 
         prev = seen.get(key, {})
         prev_yes = safe_float(prev.get("yes"), yes)
@@ -357,50 +307,54 @@ def scan_once(state: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
         vol_delta = vol24 - prev_vol24
         arb_gap = max(0.0, 1.0 - (yes + no))
 
-        score = compute_score(yes, no, liq, vol24, move_pct, vol_delta, arb_gap, bid, ask, spr)
-        candidates.append((score, key, m, yes, no, liq, vol24, move_pct, vol_delta, arb_gap, bid, ask, spr))
+        action = buy_action(yes, no, arb_gap)
+        score = compute_score(yes, no, move_pct, vol_delta, spr, arb_gap)
 
         eligible += 1
 
-        if should_alert(score, move_pct, vol_delta, arb_gap, yes, no) and cooldown_ok(state, key, score):
-            action, hint = recommendation(yes, no, arb_gap)
-            title = (m.get("question") or "Market").strip()
-            cat = (m.get("category") or "—").strip()
-            url = market_url(m)
+        # only consider BUY candidates
+        if action is not None:
+            candidates.append((score, key, m, yes, no, liq, vol24, move_pct, vol_delta, arb_gap, bid, ask, spr, action))
 
-            msg = (
-                f"🚨 ALERT | Score={score:.1f}\n"
-                f"{action}\n"
-                f"🧠 Reason: {hint} | Spread={spr:.3f} (bid={bid:.3f}/ask={ask:.3f})\n"
-                f"📊 Move={move_pct:+.2f}% | VolΔ={vol_delta:+.0f} | Liq={liq:.0f} | Vol24h={vol24:.0f}\n"
-                f"📌 {title}\n"
-                f"🏷️ {cat}\n"
-                f"🔗 {url}"
-            )
-            tg_send(msg)
-            set_cooldown(state, key)
-            sent += 1
+            if should_alert_buy(score, move_pct, vol_delta) and cooldown_ok(state, key, score):
+                action_line, hint = action
+                title = (m.get("question") or "Market").strip()
+                cat = (m.get("category") or "—").strip()
+                url = market_url(m)
+
+                msg = (
+                    f"🟢 BUY ALERT | Score={score:.1f}\n"
+                    f"{action_line}\n"
+                    f"🧠 Reason: {hint} | Spread={spr:.3f} (bid={bid:.3f}/ask={ask:.3f})\n"
+                    f"📊 Move={move_pct:+.2f}% | VolΔ={vol_delta:+.0f} | Liq={liq:.0f} | Vol24h={vol24:.0f}\n"
+                    f"📌 {title}\n"
+                    f"🏷️ {cat}\n"
+                    f"🔗 {url}"
+                )
+                tg_send(msg)
+                set_cooldown(state, key)
+                sent += 1
 
         seen[key] = {"yes": yes, "no": no, "vol24": vol24, "liq": liq, "ts": now_ts()}
 
-    # Force-send TopN every loop (but still spread-safe because candidates already filtered)
-    if ALWAYS_SEND_TOPN > 0 and candidates:
+    # Optional: forced BUY only (kept OFF by default)
+    if sent == 0 and ALWAYS_SEND_TOPN > 0 and candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
         forced = 0
-        for (score, key, m, yes, no, liq, vol24, move_pct, vol_delta, arb_gap, bid, ask, spr) in candidates:
+        for item in candidates:
             if forced >= ALWAYS_SEND_TOPN:
                 break
-            if not cooldown_ok(state, key, score) and score < 85:
+            (score, key, m, yes, no, liq, vol24, move_pct, vol_delta, arb_gap, bid, ask, spr, action) = item
+            if not cooldown_ok(state, key, score):
                 continue
-
-            action, hint = recommendation(yes, no, arb_gap)
+            action_line, hint = action
             title = (m.get("question") or "Market").strip()
             cat = (m.get("category") or "—").strip()
             url = market_url(m)
 
             msg = (
-                f"🟣 TOP PICK | Score={score:.1f}\n"
-                f"{action}\n"
+                f"🟣 FORCED BUY PICK | Score={score:.1f}\n"
+                f"{action_line}\n"
                 f"🧠 Reason: {hint} | Spread={spr:.3f} (bid={bid:.3f}/ask={ask:.3f})\n"
                 f"📊 Move={move_pct:+.2f}% | VolΔ={vol_delta:+.0f} | Liq={liq:.0f} | Vol24h={vol24:.0f}\n"
                 f"📌 {title}\n"
@@ -409,8 +363,8 @@ def scan_once(state: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
             )
             tg_send(msg)
             set_cooldown(state, key)
-            forced += 1
             sent += 1
+            forced += 1
 
     return sent, scanned, eligible, spread_out, errors
 
@@ -422,11 +376,11 @@ def main():
     state = load_state()
 
     tg_send(
-        "🤖 Bot ON (aggressive + SPREAD-SAFE)\n"
-        f"Loop={LOOP_SECONDS}s | Pages={MAX_PAGES}x{PAGE_LIMIT} | Cooldown={COOLDOWN_MIN}min | ForceTopN={ALWAYS_SEND_TOPN}\n"
+        "🤖 Bot ON (BUY-ONLY + LESS SPAM)\n"
+        f"Loop={LOOP_SECONDS}s | Cooldown={COOLDOWN_MIN}min | ForceBuyTopN={ALWAYS_SEND_TOPN}\n"
         f"MinLiq={MIN_LIQ:.0f} | MinVol24h={MIN_VOL24H:.0f} | MaxSpread={MAX_SPREAD:.2f} | MinBid={MIN_BID:.2f}\n"
-        f"Cheap≤{CHEAP_MAX:.2f} | Expensive≥{EXPENSIVE_MIN:.2f} | ArbEdge≥{ARB_EDGE:.3f}\n"
-        f"MoveAlert≥{MOVE_PCT_ALERT:.1f}% | VolΔAlert≥{VOL_DELTA_ALERT:.0f}"
+        f"SCORE_ALERT≥{SCORE_ALERT:.0f} | MoveAlert≥{MOVE_PCT_ALERT:.1f}% | VolΔAlert≥{VOL_DELTA_ALERT:.0f}\n"
+        f"BUY rules: CHEAP≤{CHEAP_MAX:.2f} or ARB gap≥{ARB_EDGE:.3f}"
     )
 
     while True:
@@ -437,7 +391,7 @@ def main():
 
             if SEND_DIAGNOSTIC:
                 tg_send(
-                    f"📊 Scan: scanned={scanned} | eligible(liq/vol)={eligible} | spread_filtered={spread_out} | alerts_sent={sent} | errors={errs}"
+                    f"📊 Scan: scanned={scanned} | eligible={eligible} | spread_filtered={spread_out} | BUY_alerts_sent={sent} | errors={errs}"
                 )
 
             if errs:
