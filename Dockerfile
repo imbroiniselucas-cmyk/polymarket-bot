@@ -1,10 +1,10 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Sem dependências externas (stdlib only), então não precisa pip install.
+COPY main.py /app/main.py
 
-COPY . .
+ENV PYTHONUNBUFFERED=1
 
 CMD ["python", "main.py"]
