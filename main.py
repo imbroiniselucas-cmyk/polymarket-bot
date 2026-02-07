@@ -5,7 +5,8 @@ import os
 import time
 import json
 import math
-import requests
+import urllib.request
+import urllib.parse
 from datetime import datetime, timezone
 
 # =========================
@@ -20,29 +21,26 @@ MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "50"))
 REPEAT_COOLDOWN_SEC = int(os.getenv("REPEAT_COOLDOWN_SEC", "30"))
 
 PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "250"))
-MAX_PAGES = int(os.getenv("MAX_PAGES", "6"))  # ~1500
+MAX_PAGES = int(os.getenv("MAX_PAGES", "6"))  # ~1500 mercados
 
 DEBUG_EVERY_SEC = int(os.getenv("DEBUG_EVERY_SEC", "180"))
 
-# ---- Strategy knobs ----
-# Arbitrage: requires (1 - (yes+no) - FEE_BUFFER) >= ARB_GAP_MIN
-ARB_GAP_MIN = float(os.getenv("ARB_GAP_MIN", "0.007"))      # 0.7%
-FEE_BUFFER  = float(os.getenv("FEE_BUFFER",  "0.003"))      # 0.3% (fees/slippage cushion)
+# Arbitragem
+ARB_GAP_MIN = float(os.getenv("ARB_GAP_MIN", "0.007"))   # 0.7%
+FEE_BUFFER  = float(os.getenv("FEE_BUFFER",  "0.003"))   # 0.3% buffer (fee/slippage)
 
-# Cheap quotes thresholds
-CHEAP_MAX_PRICE = float(os.getenv("CHEAP_MAX_PRICE", "0.10"))  # <= 0.10 is "cheap"
-CHEAP_MID_BONUS = float(os.getenv("CHEAP_MID_BONUS", "0.02"))  # bonus if also near mid
+# Cheap quotes
+CHEAP_MAX_PRICE = float(os.getenv("CHEAP_MAX_PRICE", "0.10"))  # <= 0.10 barato
 
-# Spread trap / data sanity (proxy)
-# sum_err = abs((yes+no) - 1.0). High => stale/odd data => penalize or skip
-SUM_ERR_SKIP = float(os.getenv("SUM_ERR_SKIP", "0.12"))     # if > 0.12 skip unless arb is strong
-SUM_ERR_PEN_W = float(os.getenv("SUM_ERR_PEN_W", "60"))     # penalty weight
+# Spread/data sanity (proxy)
+SUM_ERR_SKIP = float(os.getenv("SUM_ERR_SKIP", "0.12"))
+SUM_ERR_PEN_W = float(os.getenv("SUM_ERR_PEN_W", "60"))
 
-# Optional score filter (0 = no filter)
-SCORE_MIN = float(os.getenv("SCORE_MIN", "0"))              # set 30 if you want
+# Score filter opcional
+SCORE_MIN = float(os.getenv("SCORE_MIN", "0"))  # set 30 se quiser filtrar
 
 # =========================
-# HELPERS
+# UTIL
 # =========================
 def now_utc():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
@@ -63,54 +61,90 @@ def clamp01(x):
         return None
     return clamp(x, 0.0, 1.0)
 
-def tg_api(method: str, payload=None, timeout=20):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
-    r = requests.post(url, json=payload or {}, timeout=timeout)
-    return r.status_code, r.text
+# =========================
+# HTTP (stdlib)
+# =========================
+def http_get_json(url: str, timeout: int = 25):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+        return json.loads(body)
 
+def http_post_json(url: str, payload: dict, timeout: int = 20):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            return resp.status, body
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
+        return e.code, body
+    except Exception as e:
+        return 0, repr(e)
+
+# =========================
+# TELEGRAM
+# =========================
 def tg_send(text: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID.")
         return False
 
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "disable_web_page_preview": True,
     }
 
-    status, body = tg_api("sendMessage", payload)
+    status, body = http_post_json(url, payload, timeout=20)
     if status == 200:
         return True
 
-    # Telegram rate limit
-    if status == 429:
+    # 429 rate limit
+    if status == 429 and "retry_after" in body:
         retry_after = 2
         try:
-            if "retry_after" in body:
-                import re
-                m = re.search(r"retry_after\":\s*(\d+)", body)
-                if m:
-                    retry_after = int(m.group(1))
+            # parse retry_after from json if possible
+            data = json.loads(body)
+            retry_after = int(data.get("parameters", {}).get("retry_after", 2))
         except Exception:
+            # fallback: keep 2
             pass
-
         print(f"⚠️ Telegram 429. Sleep {retry_after}s and retry.")
         time.sleep(retry_after)
-        status2, body2 = tg_api("sendMessage", payload)
+        status2, body2 = http_post_json(url, payload, timeout=20)
         if status2 == 200:
             return True
-        print("❌ Telegram failed after retry:", status2, body2[:400])
+        print("❌ Telegram send failed after retry:", status2, body2[:300])
         return False
 
-    print("❌ Telegram sendMessage failed:", status, body[:400])
+    print("❌ Telegram send failed:", status, body[:300])
     return False
 
-def gamma_get(path, params=None, timeout=25):
-    url = GAMMA_URL + path
-    r = requests.get(url, params=params or {}, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+def tg_get_me_ok() -> bool:
+    if not TELEGRAM_TOKEN:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe"
+    status, body = http_post_json(url, {}, timeout=15)
+    return status == 200
+
+# =========================
+# GAMMA
+# =========================
+def gamma_get(path: str, params: dict, timeout: int = 25):
+    qs = urllib.parse.urlencode(params)
+    url = f"{GAMMA_URL}{path}?{qs}"
+    return http_get_json(url, timeout=timeout)
 
 def extract_list(payload):
     if isinstance(payload, list):
@@ -120,6 +154,52 @@ def extract_list(payload):
             if isinstance(payload.get(k), list):
                 return payload[k]
     return []
+
+def fetch_markets_paged():
+    all_markets = []
+    used = "/markets"
+    last_err = None
+
+    for page in range(MAX_PAGES):
+        offset = page * PAGE_LIMIT
+        try:
+            data = gamma_get("/markets", params={
+                "active": "true",
+                "closed": "false",
+                "limit": str(PAGE_LIMIT),
+                "offset": str(offset),
+                "order": "volume24hr",
+                "ascending": "false",
+            }, timeout=25)
+            lst = extract_list(data)
+            if not lst:
+                break
+            all_markets.extend(lst)
+        except Exception as e:
+            last_err = repr(e)
+            break
+
+    # fallback events
+    if not all_markets:
+        try:
+            used = "/events"
+            data = gamma_get("/events", params={
+                "active": "true",
+                "closed": "false",
+                "limit": "200",
+                "offset": "0",
+            }, timeout=25)
+            evs = extract_list(data)
+            mkts = []
+            for ev in evs:
+                if isinstance(ev, dict) and isinstance(ev.get("markets"), list):
+                    mkts.extend(ev["markets"])
+            if mkts:
+                return mkts, None, used
+        except Exception as e:
+            last_err = repr(e)
+
+    return all_markets, last_err, used
 
 def market_url(market: dict):
     slug = market.get("slug")
@@ -147,56 +227,7 @@ def get_liq_vol(market: dict):
     return liq, vol24
 
 # =========================
-# FETCH MARKETS (PAGINATED)
-# =========================
-def fetch_markets_paged():
-    all_markets = []
-    used = "/markets"
-    last_err = None
-
-    for page in range(MAX_PAGES):
-        offset = page * PAGE_LIMIT
-        try:
-            data = gamma_get("/markets", params={
-                "active": "true",
-                "closed": "false",
-                "limit": str(PAGE_LIMIT),
-                "offset": str(offset),
-                "order": "volume24hr",
-                "ascending": "false",
-            })
-            lst = extract_list(data)
-            if not lst:
-                break
-            all_markets.extend(lst)
-        except Exception as e:
-            last_err = repr(e)
-            break
-
-    # fallback: /events
-    if not all_markets:
-        try:
-            used = "/events"
-            data = gamma_get("/events", params={
-                "active": "true",
-                "closed": "false",
-                "limit": "200",
-                "offset": "0",
-            })
-            evs = extract_list(data)
-            mkts = []
-            for ev in evs:
-                if isinstance(ev, dict) and isinstance(ev.get("markets"), list):
-                    mkts.extend(ev["markets"])
-            if mkts:
-                return mkts, None, used
-        except Exception as e:
-            last_err = repr(e)
-
-    return all_markets, last_err, used
-
-# =========================
-# PARSE YES/NO (robust)
+# PARSE PRICES (robust)
 # =========================
 def parse_outcome_prices(value):
     if value is None:
@@ -226,14 +257,12 @@ def parse_yes_no(market: dict):
         yes = safe_float(op[0], None)
         no  = safe_float(op[1], None)
 
-    # tokens fallback
     if (yes is None or no is None) and isinstance(market.get("tokens"), list):
         toks = market["tokens"]
         if len(toks) >= 2:
             yes = safe_float(toks[0].get("price"), yes)
             no  = safe_float(toks[1].get("price"), no)
 
-    # last price fallback
     if yes is None:
         lp = market.get("lastTradePrice") or market.get("lastPrice") or market.get("last_price")
         yes = safe_float(lp, None)
@@ -247,57 +276,37 @@ def parse_yes_no(market: dict):
     return yes, no
 
 # =========================
-# SIGNALS: arbitrage / cheap / spread
+# SIGNALS + SCORE
 # =========================
 def arb_gap(yes: float, no: float) -> float:
-    # Positive means YES+NO < 1 (discount)
     return 1.0 - (yes + no)
 
-def mid_pref(yes: float) -> float:
-    # 1 at 0.5, 0 at 0 or 1
-    return clamp(1.0 - abs(yes - 0.5) * 2.0, 0.0, 1.0)
-
 def cheap_side(yes: float, no: float):
-    # Returns ("BUY_YES"/"BUY_NO", cheapness_value) or (None, 0)
-    # cheapness_value bigger when price smaller
+    # returns (kind, cheapness 0..1)
     if yes <= CHEAP_MAX_PRICE:
-        return "BUY_YES", (CHEAP_MAX_PRICE - yes) / max(CHEAP_MAX_PRICE, 1e-9)
+        return "CHEAP_BUY_YES", (CHEAP_MAX_PRICE - yes) / max(CHEAP_MAX_PRICE, 1e-9)
     if no <= CHEAP_MAX_PRICE:
-        return "BUY_NO", (CHEAP_MAX_PRICE - no) / max(CHEAP_MAX_PRICE, 1e-9)
+        return "CHEAP_BUY_NO", (CHEAP_MAX_PRICE - no) / max(CHEAP_MAX_PRICE, 1e-9)
     return None, 0.0
 
-def score_combo(yes: float, no: float, liq: float, vol24: float, net_gap: float, cheapness: float, sum_err: float) -> float:
-    """
-    Score 0-100:
-    - Arbitrage net gap drives score most (up to 55)
-    - Cheapness drives (up to 25)
-    - Liquidity/Volume drive (up to 20)
-    - Penalize spread proxy/sanity issues (sum_err)
-    """
-    # normalize net_gap: 0% -> 0, 5% -> 1
+def score_combo(net_gap: float, cheapness: float, liq: float, vol24: float, sum_err: float) -> float:
+    # normalize gap: 0..5%
     gap_n = clamp(net_gap / 0.05, 0.0, 1.0)
-
     liq_n = clamp(math.log10(liq + 1.0) / 5.0, 0.0, 1.0)
     vol_n = clamp(math.log10(vol24 + 1.0) / 6.0, 0.0, 1.0)
 
-    base = (55.0 * gap_n) + (25.0 * clamp(cheapness, 0.0, 1.0)) + (12.0 * liq_n) + (8.0 * vol_n)
-
-    # extra small bonus if near mid (tradeable)
-    base += CHEAP_MID_BONUS * 100.0 * mid_pref(yes)
-
-    # penalty for “spread proxy” / odd data
+    base = (60.0 * gap_n) + (22.0 * clamp(cheapness, 0.0, 1.0)) + (10.0 * liq_n) + (8.0 * vol_n)
     pen = min(SUM_ERR_PEN_W * sum_err, 45.0)
-
     return round(clamp(base - pen, 0.0, 100.0), 1)
 
 # =========================
-# OUTPUT FORMAT
+# FORMAT
 # =========================
-def format_alert(market: dict, kind: str, score: float, yes: float, no: float, liq: float, vol24: float, details: str):
+def format_msg(market: dict, header: str, score: float, yes: float, no: float, liq: float, vol24: float, details: str):
     title = (market.get("question") or market.get("title") or "Market").strip()
     url = market_url(market)
     return (
-        f"🚨 {kind} | Score {score}\n"
+        f"🚨 {header} | Score {score}\n"
         f"🧠 {title}\n"
         f"💰 YES {yes:.3f} | NO {no:.3f}\n"
         f"📊 Liq {int(liq)} | Vol24h {int(vol24)}\n"
@@ -330,11 +339,11 @@ def make_key(market: dict, kind: str, yes: float, no: float):
 # =========================
 def boot():
     print("BOOT_OK: main.py running")
-    st, body = tg_api("getMe", {})
-    if st != 200:
-        print("❌ Telegram getMe failed:", st, body[:300])
+    ok = tg_get_me_ok()
+    if not ok:
+        print("❌ Telegram getMe failed (token?).")
     tg_send(
-        "✅ Bot ON | BUY-only | arbitrage+spread+cheap+score\n"
+        "✅ Bot ON | BUY-only | arbitrage+spread+cheap+score (stdlib)\n"
         f"gap_min={ARB_GAP_MIN*100:.2f}% | buffer={FEE_BUFFER*100:.2f}% | cheap≤{CHEAP_MAX_PRICE:.2f}\n"
         f"poll={POLL_SECONDS}s | pages={MAX_PAGES}x{PAGE_LIMIT} | max/cycle={MAX_ALERTS_PER_CYCLE} | score_min={SCORE_MIN}"
     )
@@ -346,7 +355,7 @@ def main():
     while True:
         markets, err, used = fetch_markets_paged()
         if not markets:
-            tg_send(f"⚠️ Gamma retornou 0 mercados.\nEndpoint: {used}\nErro: {err}\nHora: {now_utc()}")
+            tg_send(f"⚠️ Gamma 0 mercados.\nEndpoint: {used}\nErro: {err}\nHora: {now_utc()}")
             time.sleep(POLL_SECONDS)
             continue
 
@@ -360,56 +369,51 @@ def main():
             parse_ok += 1
 
             liq, vol24 = get_liq_vol(m)
-            sum_err = abs((yes + no) - 1.0)  # spread proxy / sanity
+            sum_err = abs((yes + no) - 1.0)
+
             gap = arb_gap(yes, no)
             net_gap = gap - FEE_BUFFER
 
-            # If data looks weird, skip unless arbitrage is really strong
+            # se dados muito estranhos, só aceita se arbitragem for bem forte
             if sum_err > SUM_ERR_SKIP and net_gap < (ARB_GAP_MIN * 2):
                 continue
 
-            # 1) Arbitrage opportunity (buy both)
+            # 1) Arbitragem real: BUY YES + BUY NO
             if net_gap >= ARB_GAP_MIN:
-                # cheapness can also contribute if one side is very low
                 _, cheapness = cheap_side(yes, no)
-                score = score_combo(yes, no, liq, vol24, net_gap, cheapness, sum_err)
-
+                score = score_combo(net_gap, cheapness, liq, vol24, sum_err)
                 if score >= SCORE_MIN:
-                    kind = "ARBITRAGEM (BUY YES + BUY NO)"
                     details = (
-                        f"AÇÃO: comprar os dois lados. "
-                        f"YES+NO={yes+no:.3f} | ArbGap bruto={gap*100:.2f}% | líquido≈{net_gap*100:.2f}% "
+                        f"AÇÃO: BUY YES + BUY NO. "
+                        f"YES+NO={yes+no:.3f} | Gap bruto={gap*100:.2f}% | Gap líquido≈{net_gap*100:.2f}% "
                         f"| spread_proxy={sum_err:.3f}"
                     )
                     key = make_key(m, "ARB", yes, no)
                     if should_send(key):
-                        candidates.append((score, m, kind, yes, no, liq, vol24, details))
-                continue  # arbitrage is top priority
+                        candidates.append((score, m, "ARBITRAGEM (BUY YES + BUY NO)", yes, no, liq, vol24, details))
+                continue
 
-            # 2) Cheap quote (single side)
-            rec, cheapness = cheap_side(yes, no)
-            if rec:
-                # treat “cheap” as a smaller edge signal (net_gap=0)
-                score = score_combo(yes, no, liq, vol24, 0.0, cheapness, sum_err)
-
+            # 2) Cheap quotes: BUY lado barato
+            kind, cheapness = cheap_side(yes, no)
+            if kind:
+                score = score_combo(0.0, cheapness, liq, vol24, sum_err)
                 if score >= SCORE_MIN:
-                    if rec == "BUY_YES":
-                        kind = "CHEAP (BUY YES)"
-                        details = f"AÇÃO: BUY YES (barato). yes={yes:.3f} ≤ {CHEAP_MAX_PRICE:.2f} | spread_proxy={sum_err:.3f}"
+                    if kind == "CHEAP_BUY_YES":
+                        header = "CHEAP (BUY YES)"
+                        details = f"AÇÃO: BUY YES (barato). YES={yes:.3f} ≤ {CHEAP_MAX_PRICE:.2f} | spread_proxy={sum_err:.3f}"
                     else:
-                        kind = "CHEAP (BUY NO)"
-                        details = f"AÇÃO: BUY NO (barato). no={no:.3f} ≤ {CHEAP_MAX_PRICE:.2f} | spread_proxy={sum_err:.3f}"
+                        header = "CHEAP (BUY NO)"
+                        details = f"AÇÃO: BUY NO (barato). NO={no:.3f} ≤ {CHEAP_MAX_PRICE:.2f} | spread_proxy={sum_err:.3f}"
 
                     key = make_key(m, "CHEAP", yes, no)
                     if should_send(key):
-                        candidates.append((score, m, kind, yes, no, liq, vol24, details))
+                        candidates.append((score, m, header, yes, no, liq, vol24, details))
 
-        # send best first
         candidates.sort(key=lambda x: x[0], reverse=True)
 
         sent = 0
-        for score, m, kind, yes, no, liq, vol24, details in candidates[:MAX_ALERTS_PER_CYCLE]:
-            msg = format_alert(m, kind, score, yes, no, liq, vol24, details)
+        for score, m, header, yes, no, liq, vol24, details in candidates[:MAX_ALERTS_PER_CYCLE]:
+            msg = format_msg(m, header, score, yes, no, liq, vol24, details)
             if tg_send(msg):
                 sent += 1
 
