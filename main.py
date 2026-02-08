@@ -10,33 +10,48 @@ import urllib.parse
 from datetime import datetime, timezone
 
 # =========================
-# REQUIRED ENV (não vou pedir pra mexer; só aviso se faltar)
+# REQUIRED ENV (precisa existir)
 # =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 GAMMA_URL = os.getenv("GAMMA_URL", "https://gamma-api.polymarket.com").rstrip("/")
 
 # =========================
-# HARD-CODED SETTINGS (agressivo sem Variables)
+# HARD SETTINGS (sem mexer em Variables)
 # =========================
-POLL_SECONDS = 45               # escaneia rápido
-MAX_ALERTS_PER_CYCLE = 80       # manda bastante
-REPEAT_COOLDOWN_SEC = 15        # permite repetir cedo
+POLL_SECONDS = 35                 # mais agressivo
+MAX_ALERTS_PER_CYCLE = 70         # manda bastante
 PAGE_LIMIT = 250
-MAX_PAGES = 6                   # ~1500 mercados/ciclo
+MAX_PAGES = 8                     # ~2000 mercados/ciclo (8*250)
+HEARTBEAT_EVERY_SEC = 180         # 3 min
 
-# Heartbeat (mensagem se não mandar oportunidades)
-HEARTBEAT_EVERY_SEC = 180       # 3 min
+# ===== Repetição / anti-spam (inteligente) =====
+# Não repete o mesmo mercado/tipo se nada mudou.
+MARKET_COOLDOWN_SEC = 8 * 60      # 8 min por mercado/tipo (se não mudar)
+PRICE_DELTA_RESEND = 0.015        # reenviar se preço mudou >= 1.5 cent
+SCORE_DELTA_RESEND = 8.0          # reenviar se score mudou >= 8 pontos
+MIN_SECONDS_BETWEEN_ANY_SEND = 1  # evita 429
 
-# Estratégia agressiva (sem mexer em env vars)
-ARB_GAP_MIN = 0.003             # 0.3% gap líquido mínimo (bem agressivo)
-FEE_BUFFER = 0.002              # 0.2% buffer
-CHEAP_MAX_PRICE = 0.15          # “barato” até 15 cents
-SCORE_MIN = 0.0                 # não filtra
+# ===== Estratégia (mais flexível/agressiva) =====
+# Arbitragem: aceita micro gaps
+ARB_GAP_MIN_NET = 0.0025          # 0.25% líquido (bem agressivo)
+FEE_BUFFER = 0.0015               # 0.15% buffer
 
-# Sanity/spread proxy: penaliza dados “esquisitos” mas não bloqueia demais
-SUM_ERR_PEN_W = 45.0            # penalidade (quanto maior, mais “conservador”)
-SUM_ERR_SOFT_SKIP = 0.25        # se sum_err acima disso e sem arb forte, ignora
+# Cheap: mais amplo
+CHEAP_MAX_PRICE = 0.18            # barato até 18 cents
+
+# Mispricing (sem dados externos):
+# dispara quando um lado está MUITO barato, mas o mercado tem volume/liq (evita mercado morto)
+MISPRICE_MAX_PRICE = 0.25         # lado <= 25 cents
+MISPRICE_MIN_LIQ = 3000           # liquidez mínima
+MISPRICE_MIN_VOL24 = 1500         # volume 24h mínimo
+
+# Sanity/spread proxy: penaliza dados estranhos, mas não bloqueia tudo
+SUM_ERR_SOFT_SKIP = 0.28          # se abs(yes+no-1) > isso, ignora (salvo arb forte)
+SUM_ERR_PEN_W = 45.0
+
+# Score: não filtra por padrão (pode ajustar aqui)
+SCORE_MIN = 0.0
 
 # =========================
 # UTIL
@@ -61,7 +76,7 @@ def clamp01(x):
     return clamp(x, 0.0, 1.0)
 
 # =========================
-# HTTP (stdlib only)
+# HTTP (stdlib)
 # =========================
 def http_get_json(url: str, timeout: int = 25):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -90,15 +105,26 @@ def http_post_json(url: str, payload: dict, timeout: int = 20):
 # =========================
 # TELEGRAM
 # =========================
+_last_send_ts = 0
+
 def tg_send(text: str) -> bool:
+    global _last_send_ts
+
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID (env vars).")
         return False
+
+    # pacing simples para não bater 429
+    now = time.time()
+    if now - _last_send_ts < MIN_SECONDS_BETWEEN_ANY_SEND:
+        time.sleep(MIN_SECONDS_BETWEEN_ANY_SEND - (now - _last_send_ts))
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
 
     status, body = http_post_json(url, payload, timeout=20)
+    _last_send_ts = time.time()
+
     if status == 200:
         return True
 
@@ -113,6 +139,7 @@ def tg_send(text: str) -> bool:
         print(f"⚠️ Telegram 429. Sleep {retry_after}s then retry.")
         time.sleep(retry_after)
         status2, body2 = http_post_json(url, payload, timeout=20)
+        _last_send_ts = time.time()
         if status2 == 200:
             return True
         print("❌ Telegram send failed after retry:", status2, body2[:300])
@@ -253,27 +280,41 @@ def arb_gap(yes: float, no: float) -> float:
     return 1.0 - (yes + no)
 
 def cheap_side(yes: float, no: float):
-    # returns (header, cheapness 0..1)
+    # returns (header, side_price, cheapness 0..1)
     if yes <= CHEAP_MAX_PRICE:
-        return "CHEAP (BUY YES)", (CHEAP_MAX_PRICE - yes) / max(CHEAP_MAX_PRICE, 1e-9)
+        return "CHEAP (BUY YES)", yes, (CHEAP_MAX_PRICE - yes) / max(CHEAP_MAX_PRICE, 1e-9)
     if no <= CHEAP_MAX_PRICE:
-        return "CHEAP (BUY NO)", (CHEAP_MAX_PRICE - no) / max(CHEAP_MAX_PRICE, 1e-9)
-    return None, 0.0
+        return "CHEAP (BUY NO)", no, (CHEAP_MAX_PRICE - no) / max(CHEAP_MAX_PRICE, 1e-9)
+    return None, None, 0.0
 
-def score_combo(net_gap: float, cheapness: float, liq: float, vol24: float, sum_err: float) -> float:
-    gap_n = clamp(net_gap / 0.05, 0.0, 1.0)              # 0..5%
-    liq_n = clamp(math.log10(liq + 1.0) / 5.0, 0.0, 1.0) # 1e5 -> ~1
-    vol_n = clamp(math.log10(vol24 + 1.0) / 6.0, 0.0, 1.0) # 1e6 -> ~1
+def misprice_side(yes: float, no: float, liq: float, vol24: float):
+    # mais flexível: lado <= 0.25, mas exige mercado “vivo”
+    if liq < MISPRICE_MIN_LIQ or vol24 < MISPRICE_MIN_VOL24:
+        return None, None, 0.0
 
-    base = (62.0 * gap_n) + (20.0 * clamp(cheapness, 0.0, 1.0)) + (10.0 * liq_n) + (8.0 * vol_n)
+    # define “mispricing” como lado muito barato, porém não tão extremo quanto CHEAP
+    if yes <= MISPRICE_MAX_PRICE:
+        # quanto mais barato, maior
+        return "MISPRICING (BUY YES)", yes, (MISPRICE_MAX_PRICE - yes) / max(MISPRICE_MAX_PRICE, 1e-9)
+    if no <= MISPRICE_MAX_PRICE:
+        return "MISPRICING (BUY NO)", no, (MISPRICE_MAX_PRICE - no) / max(MISPRICE_MAX_PRICE, 1e-9)
+    return None, None, 0.0
+
+def score(net_gap: float, cheapness: float, liq: float, vol24: float, sum_err: float) -> float:
+    # normalize gap: 0..5%
+    gap_n = clamp(net_gap / 0.05, 0.0, 1.0)
+    liq_n = clamp(math.log10(liq + 1.0) / 5.0, 0.0, 1.0)
+    vol_n = clamp(math.log10(vol24 + 1.0) / 6.0, 0.0, 1.0)
+
+    base = (62.0 * gap_n) + (22.0 * clamp(cheapness, 0.0, 1.0)) + (10.0 * liq_n) + (6.0 * vol_n)
     pen = min(SUM_ERR_PEN_W * sum_err, 45.0)
     return round(clamp(base - pen, 0.0, 100.0), 1)
 
-def format_msg(market: dict, header: str, score: float, yes: float, no: float, liq: float, vol24: float, details: str):
+def format_msg(market: dict, header: str, sc: float, yes: float, no: float, liq: float, vol24: float, details: str):
     title = (market.get("question") or market.get("title") or "Market").strip()
     url = market_url(market)
     return (
-        f"🚨 {header} | Score {score}\n"
+        f"🚨 {header} | Score {sc}\n"
         f"🧠 {title}\n"
         f"💰 YES {yes:.3f} | NO {no:.3f}\n"
         f"📊 Liq {int(liq)} | Vol24h {int(vol24)}\n"
@@ -283,33 +324,54 @@ def format_msg(market: dict, header: str, score: float, yes: float, no: float, l
     )
 
 # =========================
-# DEDUPE (para repetir sem spam infinito)
+# DEDUPE INTELIGENTE (para não repetir)
 # =========================
-last_sent = {}
+# key -> {ts, yes, no, score}
+sent_state = {}
 
-def should_send(key: str):
+def should_send_smart(key: str, yes: float, no: float, sc: float) -> bool:
+    """
+    Regra:
+    - Se nunca enviou: envia
+    - Se passou cooldown (8 min): envia
+    - OU se preço mudou >= 1.5c
+    - OU score mudou >= 8
+    """
     now = time.time()
-    ts = last_sent.get(key, 0)
-    if now - ts >= REPEAT_COOLDOWN_SEC:
-        last_sent[key] = now
+    prev = sent_state.get(key)
+
+    if prev is None:
+        sent_state[key] = {"ts": now, "yes": yes, "no": no, "score": sc}
         return True
+
+    dt = now - prev["ts"]
+    if dt >= MARKET_COOLDOWN_SEC:
+        sent_state[key] = {"ts": now, "yes": yes, "no": no, "score": sc}
+        return True
+
+    if abs(yes - prev["yes"]) >= PRICE_DELTA_RESEND or abs(no - prev["no"]) >= PRICE_DELTA_RESEND:
+        sent_state[key] = {"ts": now, "yes": yes, "no": no, "score": sc}
+        return True
+
+    if abs(sc - prev["score"]) >= SCORE_DELTA_RESEND:
+        sent_state[key] = {"ts": now, "yes": yes, "no": no, "score": sc}
+        return True
+
     return False
 
-def make_key(market: dict, kind: str, yes: float, no: float):
+def make_key(market: dict, kind: str):
     mid = market.get("id") or market.get("conditionId") or market.get("slug") or (market.get("question") or "m")
-    return f"{mid}:{kind}:{round(yes,3)}:{round(no,3)}"
+    return f"{mid}:{kind}"
 
 # =========================
 # MAIN
 # =========================
 def boot():
     print("BOOT_OK: main.py running")
-    # Sempre tenta mandar boot message; se não mandar, pelo menos loga.
     tg_send(
-        "✅ Bot ON (sem mexer em Variables)\n"
-        "Modo: arbitragem + barato + score + heartbeat\n"
-        f"gap_min={ARB_GAP_MIN*100:.2f}% | buffer={FEE_BUFFER*100:.2f}% | cheap≤{CHEAP_MAX_PRICE:.2f}\n"
-        f"poll={POLL_SECONDS}s | max/cycle={MAX_ALERTS_PER_CYCLE} | pages={MAX_PAGES}x{PAGE_LIMIT}\n"
+        "✅ Bot ON | agressivo + flexível | sem alertas repetidos\n"
+        f"poll={POLL_SECONDS}s | scan≈{MAX_PAGES*PAGE_LIMIT} mercados/ciclo | max/cycle={MAX_ALERTS_PER_CYCLE}\n"
+        f"arb_net≥{ARB_GAP_MIN_NET*100:.2f}% (buffer {FEE_BUFFER*100:.2f}%) | cheap≤{CHEAP_MAX_PRICE:.2f} | misprice≤{MISPRICE_MAX_PRICE:.2f}\n"
         f"🕒 {now_utc()}"
     )
 
@@ -319,7 +381,6 @@ def main():
 
     while True:
         markets, err, used = fetch_markets_paged()
-
         if not markets:
             tg_send(f"⚠️ Gamma 0 mercados.\nEndpoint: {used}\nErro: {err}\n🕒 {now_utc()}")
             time.sleep(POLL_SECONDS)
@@ -340,51 +401,68 @@ def main():
             gap = arb_gap(yes, no)
             net_gap = gap - FEE_BUFFER
 
-            # “spread trap” suave: se dados muito esquisitos e sem arb forte, ignora
-            if sum_err > SUM_ERR_SOFT_SKIP and net_gap < (ARB_GAP_MIN * 2):
+            # se dados MUITO esquisitos e sem arb forte, ignora
+            if sum_err > SUM_ERR_SOFT_SKIP and net_gap < (ARB_GAP_MIN_NET * 2):
                 continue
 
-            # 1) Arbitragem
-            if net_gap >= ARB_GAP_MIN:
-                _, cheapness = cheap_side(yes, no)
-                score = score_combo(net_gap, cheapness, liq, vol24, sum_err)
-                if score >= SCORE_MIN:
+            # 1) ARBITRAGEM
+            if net_gap >= ARB_GAP_MIN_NET:
+                # cheapness ajuda score se um lado também estiver baixo
+                _, _, cheapness = cheap_side(yes, no)
+                sc = score(net_gap, cheapness, liq, vol24, sum_err)
+
+                if sc >= SCORE_MIN:
                     details = (
                         f"AÇÃO: BUY YES + BUY NO | YES+NO={yes+no:.3f} | "
-                        f"Gap bruto={gap*100:.2f}% | Gap líquido≈{net_gap*100:.2f}% | spread_proxy={sum_err:.3f}"
+                        f"gap bruto={gap*100:.2f}% | gap líquido≈{net_gap*100:.2f}% | spread_proxy={sum_err:.3f}"
                     )
-                    key = make_key(m, "ARB", yes, no)
-                    if should_send(key):
-                        candidates.append((score, m, "ARBITRAGEM (BUY YES + BUY NO)", yes, no, liq, vol24, details))
+                    key = make_key(m, "ARB")
+                    if should_send_smart(key, yes, no, sc):
+                        candidates.append((sc, m, "ARBITRAGEM (BUY YES + BUY NO)", yes, no, liq, vol24, details))
                 continue
 
-            # 2) Barato
-            header, cheapness = cheap_side(yes, no)
+            # 2) CHEAP
+            header, side_price, cheapness = cheap_side(yes, no)
             if header:
-                score = score_combo(0.0, cheapness, liq, vol24, sum_err)
-                if score >= SCORE_MIN:
-                    details = f"AÇÃO: {header.replace('CHEAP ', '')} | cheap≤{CHEAP_MAX_PRICE:.2f} | spread_proxy={sum_err:.3f}"
-                    key = make_key(m, "CHEAP", yes, no)
-                    if should_send(key):
-                        candidates.append((score, m, header, yes, no, liq, vol24, details))
+                sc = score(0.0, cheapness, liq, vol24, sum_err)
+                if sc >= SCORE_MIN:
+                    details = f"AÇÃO: {header.replace('CHEAP ', '')} | preço={side_price:.3f} | spread_proxy={sum_err:.3f}"
+                    key = make_key(m, header)
+                    if should_send_smart(key, yes, no, sc):
+                        candidates.append((sc, m, header, yes, no, liq, vol24, details))
+                continue
 
+            # 3) MISPRICING (flexível)
+            header2, side_price2, misp = misprice_side(yes, no, liq, vol24)
+            if header2:
+                # mispricing conta como “cheapness leve”
+                sc = score(0.0, 0.65 * misp, liq, vol24, sum_err)
+                if sc >= SCORE_MIN:
+                    details = (
+                        f"AÇÃO: {header2.split(' (')[1].replace(')', '')} | preço={side_price2:.3f} | "
+                        f"liq={int(liq)} vol24={int(vol24)} | spread_proxy={sum_err:.3f}"
+                    )
+                    key = make_key(m, header2)
+                    if should_send_smart(key, yes, no, sc):
+                        candidates.append((sc, m, header2, yes, no, liq, vol24, details))
+
+        # manda melhores primeiro
         candidates.sort(key=lambda x: x[0], reverse=True)
 
         sent = 0
-        for score, m, header, yes, no, liq, vol24, details in candidates[:MAX_ALERTS_PER_CYCLE]:
-            if tg_send(format_msg(m, header, score, yes, no, liq, vol24, details)):
+        for sc, m, header, yes, no, liq, vol24, details in candidates[:MAX_ALERTS_PER_CYCLE]:
+            if tg_send(format_msg(m, header, sc, yes, no, liq, vol24, details)):
                 sent += 1
 
         print(f"[{now_utc()}] markets={len(markets)} parse_ok={parse_ok} candidates={len(candidates)} sent={sent} endpoint={used}")
 
-        # HEARTBEAT: se não mandou nada, avisa periodicamente
+        # heartbeat
         now = time.time()
         if sent == 0 and (now - last_heartbeat) >= HEARTBEAT_EVERY_SEC:
             tg_send(
-                "💓 HEARTBEAT: scan OK, mas sem oportunidades agora\n"
+                "💓 HEARTBEAT: scan OK (sem oportunidades novas / sem mudanças relevantes)\n"
                 f"markets={len(markets)} | parse_ok={parse_ok} | candidates={len(candidates)} | sent={sent}\n"
-                f"gap_min={ARB_GAP_MIN*100:.2f}% | buffer={FEE_BUFFER*100:.2f}% | cheap≤{CHEAP_MAX_PRICE:.2f}\n"
-                f"endpoint={used}\n"
+                f"endpoint={used} | cooldown_market={MARKET_COOLDOWN_SEC}s | priceΔ={PRICE_DELTA_RESEND:.3f} | scoreΔ={SCORE_DELTA_RESEND}\n"
                 f"🕒 {now_utc()}"
             )
             last_heartbeat = now
