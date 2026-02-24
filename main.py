@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 def send_telegram_message(text):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        
+
         data = urllib.parse.urlencode({
             "chat_id": CHAT_ID,
             "text": text
@@ -50,7 +50,7 @@ def main():
     # Keep the bot running
     try:
         while True:
-            time.sleep(10)  # Sleep to prevent high CPU usage
+            time.sleep(10)
     except KeyboardInterrupt:
         logging.info("Bot terminated.")
 
