@@ -1,27 +1,35 @@
 import os
-import json
 import urllib.request
 import urllib.parse
+import json
 import time
 import logging
 
+logging.basicConfig(level=logging.INFO)
+
 # =========================
-# ENV VARIABLES
+# LOAD ENV VARIABLES
 # =========================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+print("🔎 Checking environment variables...")
+
+if not BOT_TOKEN:
+    print("❌ TELEGRAM_BOT_TOKEN not found!")
+else:
+    print("✅ TELEGRAM_BOT_TOKEN loaded")
+
+if not CHAT_ID:
+    print("❌ TELEGRAM_CHAT_ID not found!")
+else:
+    print("✅ TELEGRAM_CHAT_ID loaded")
+
 if not BOT_TOKEN or not CHAT_ID:
-    print("❌ TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set!")
-    exit(1)
-
-print("✅ Environment variables loaded")
-
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+    raise SystemExit("⛔ Missing required environment variables.")
 
 # =========================
-# TELEGRAM SEND FUNCTION
+# TELEGRAM FUNCTION
 # =========================
 def send_telegram_message(text):
     try:
@@ -36,23 +44,28 @@ def send_telegram_message(text):
         response = urllib.request.urlopen(req)
         result = response.read().decode()
 
-        logging.info("📩 Telegram response: %s", result)
+        print("📩 Telegram raw response:")
+        print(result)
+
+        parsed = json.loads(result)
+
+        if not parsed.get("ok"):
+            print("❌ Telegram API returned error!")
+        else:
+            print("✅ Message sent successfully!")
 
     except Exception as e:
-        logging.error("❌ Telegram send error: %s", e)
+        print("❌ Exception sending message:", e)
 
 # =========================
 # MAIN
 # =========================
 def main():
-    send_telegram_message("🚀 Bot deployed successfully and connected to Telegram.")
+    print("🚀 Bot starting...")
+    send_telegram_message("🚀 Railway deployment successful. Bot connected.")
 
-    # Keep the bot running
-    try:
-        while True:
-            time.sleep(10)
-    except KeyboardInterrupt:
-        logging.info("Bot terminated.")
+    while True:
+        time.sleep(15)
 
 if __name__ == "__main__":
     main()
